@@ -7,6 +7,15 @@ import unittest
 
 from helpers import Base
 
+# A path that is never under a temp root on Linux or macOS and is never created by these tests.
+NON_TEMP_NONEXISTENT = "/opt/leavenotrace-test-nonexistent"
+
+
+def home_is_temp(mod, home=None):
+    """True if $HOME lies under a temp root (e.g. HOME=/tmp/lnt-home), where "home-like = not temp" cannot hold."""
+    home = home or os.path.expanduser("~")
+    return mod.is_temp_path(mod.Store(os.path.join(home, ".lnt-probe")), os.path.join(home, "probe-file"))
+
 
 class TempFiles(Base):
     def write(self, path, phase, created=True, **extra):
@@ -43,7 +52,7 @@ class TempFiles(Base):
 
     def test_non_temp_paths_ignored(self):
         p = os.path.join(self.work, "src.py")  # inside the project (the work dir is under /tmp here, so use a marker-less home path)
-        home_like = os.path.join(os.path.expanduser("~"), "lnt-not-temp-%s" % os.path.basename(self.tmp))
+        home_like = os.path.join(NON_TEMP_NONEXISTENT, "lnt-not-temp-%s" % os.path.basename(self.tmp))
         self.write(home_like, "pre")
         self.write(home_like, "post")
         self.assertEqual(self.resources("temp_file"), [])
@@ -67,20 +76,42 @@ class TempFiles(Base):
         self.assertEqual(self.resources("temp_file"), [])
 
     def test_tampered_registry_cannot_delete_outside_temp(self):
-        victim = os.path.join(os.path.expanduser("~"), "lnt-precious-%s" % os.path.basename(self.tmp))
-        open(victim, "w").write("precious")
-        self.addCleanup(lambda: os.path.exists(victim) and os.remove(victim))
+        # a real, existing non-temp file when $HOME is not under a temp root (the normal case); with HOME=/tmp/... we cannot
+        # create anything outside temp without touching the machine, so fall back to a never-created non-temp path
+        # (the refusal happens on the path check, before the filesystem is consulted).
+        if home_is_temp(self.mod):
+            victim = os.path.join(NON_TEMP_NONEXISTENT, "lnt-precious-%s" % os.path.basename(self.tmp))
+        else:
+            victim = os.path.join(os.path.expanduser("~"), "lnt-precious-%s" % os.path.basename(self.tmp))
+            open(victim, "w").write("precious")
+            self.addCleanup(lambda: os.path.exists(victim) and os.remove(victim))
         store = self.mod.Store(self.home)
         with store.txn(self.sid, create=dict(owner_pid=os.getpid(), owner_start=self.mod.start_token(os.getpid()), cwd=self.work)) as d:
             self.mod.add_resource(d, "temp_file", path=victim)
             self.mod.add_resource(d, "temp_file", path="/tmp")           # the temp root itself
-            self.mod.add_resource(d, "temp_file", path="/tmp/../etc/hostname")
+            self.mod.add_resource(d, "temp_file", path="/tmp/../etc/hosts")
             self.mod.add_resource(d, "temp_file", path="relative/path.txt")
         r = self.run_cli("close", "--all-mine", "--session", self.sid)
-        self.assertTrue(os.path.exists(victim))
+        self.assertTrue(os.path.exists(victim) or home_is_temp(self.mod))
         self.assertTrue(os.path.isdir("/tmp"))
-        self.assertTrue(os.path.exists("/etc/hostname"))
+        self.assertTrue(os.path.exists("/etc/hosts"))
         self.assertEqual(r.stdout.count("refused"), 4, r.stdout)
+
+    def test_is_temp_path_resolves_macos_style_aliases(self):
+        """/tmp -> /private/tmp, /var -> /private/var and TMPDIR under /var/folders must all count as temp, roots never."""
+        mod, store = self.mod, self.mod.Store(self.home)
+        real = os.path.realpath(tempfile.gettempdir())
+        self.assertTrue(mod.is_temp_path(store, os.path.join(tempfile.gettempdir(), "x.txt")))
+        self.assertTrue(mod.is_temp_path(store, os.path.join(real, "x.txt")))
+        self.assertFalse(mod.is_temp_path(store, real))
+        self.assertFalse(mod.is_temp_path(store, tempfile.gettempdir()))
+        self.assertTrue(mod.is_temp_path(store, "/tmp/x.txt"))
+        self.assertTrue(mod.is_temp_path(store, os.path.join(os.path.realpath("/tmp"), "x.txt")))
+        self.assertFalse(mod.is_temp_path(store, "/tmp"))
+        self.assertFalse(mod.is_temp_path(store, os.path.realpath("/tmp")))
+        self.assertFalse(mod.is_temp_path(store, "/tmp/../etc/hosts"))
+        self.assertFalse(mod.is_temp_path(store, NON_TEMP_NONEXISTENT + "/x"))
+        self.assertFalse(mod.is_temp_path(store, "/etc/hosts"))
 
     def test_symlink_in_tmp_removes_link_not_target(self):
         target = os.path.join(os.path.expanduser("~"), "lnt-target-%s" % os.path.basename(self.tmp))

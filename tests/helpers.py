@@ -43,11 +43,44 @@ def wait_port(port, timeout=8.0):
 
 
 def pid_alive(pid):
+    """True if pid exists and is not a zombie (Linux /proc, otherwise `ps`)."""
+    if os.path.isdir("/proc/self"):
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                return f.read().rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+        except Exception:
+            return False
     try:
-        with open("/proc/%d/stat" % pid) as f:
-            return f.read().rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, universal_newlines=True, timeout=10).stdout.strip()
     except Exception:
         return False
+    return bool(out) and out[0] not in ("Z", "X")
+
+
+def cwd_of_all():
+    """{pid: cwd} for every process we can see (Linux /proc, otherwise one `lsof` call)."""
+    res = {}
+    if os.path.isdir("/proc/self"):
+        for name in os.listdir("/proc"):
+            if name.isdigit():
+                try:
+                    res[int(name)] = os.readlink("/proc/%s/cwd" % name)
+                except Exception:
+                    pass
+        return res
+    try:
+        out = subprocess.run(["lsof", "-nP", "-a", "-d", "cwd", "-Fpn"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, universal_newlines=True, timeout=30).stdout
+    except Exception:
+        return res
+    cur = None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            cur = int(line[1:])
+        elif line.startswith("n") and cur is not None:
+            res[cur] = line[1:]
+    return res
 
 
 def wait_dead(pid, timeout=8.0):
@@ -86,17 +119,13 @@ class Base(unittest.TestCase):
             except Exception:
                 pass
         # reap anything left over whose cwd lives in our temp dir (reparented test servers)
-        for name in os.listdir("/proc"):
-            if name.isdigit():
+        mine = (self.tmp, os.path.realpath(self.tmp))
+        for pid, cwd in cwd_of_all().items():
+            if cwd.startswith(mine) and pid != os.getpid():
                 try:
-                    cwd = os.readlink("/proc/%s/cwd" % name)
+                    os.kill(pid, 9)
                 except Exception:
-                    continue
-                if cwd.startswith(self.tmp) and int(name) != os.getpid():
-                    try:
-                        os.kill(int(name), 9)
-                    except Exception:
-                        pass
+                    pass
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # -- running things ------------------------------------------------------------

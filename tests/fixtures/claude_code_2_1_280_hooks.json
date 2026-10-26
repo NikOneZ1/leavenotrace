@@ -1,0 +1,136 @@
+{
+ "_about": "Hook payloads captured from a REAL Claude Code 2.1.280 (macOS arm64) `claude -p` run with this plugin loaded via --plugin-dir (model replaced by a scripted local API stub). Ids/paths/ports anonymised to {SID}/{CWD}/{PORT}.",
+ "session_start": {
+  "session_id": "{SID}",
+  "transcript_path": "/home/user/.claude/projects/-work/{SID}.jsonl",
+  "cwd": "{CWD}",
+  "hook_event_name": "SessionStart",
+  "source": "startup"
+ },
+ "pre_bg": {
+  "session_id": "{SID}",
+  "transcript_path": "/home/user/.claude/projects/-work/{SID}.jsonl",
+  "cwd": "{CWD}",
+  "prompt_id": "00000000-0000-4000-8000-000000000001",
+  "permission_mode": "bypassPermissions",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+   "command": "python3 -m http.server {PORT} --bind 127.0.0.1",
+   "run_in_background": true
+  },
+  "tool_use_id": "toolu_01"
+ },
+ "post_bg": {
+  "session_id": "{SID}",
+  "transcript_path": "/home/user/.claude/projects/-work/{SID}.jsonl",
+  "cwd": "{CWD}",
+  "prompt_id": "00000000-0000-4000-8000-000000000001",
+  "permission_mode": "bypassPermissions",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+   "command": "python3 -m http.server {PORT} --bind 127.0.0.1",
+   "run_in_background": true
+  },
+  "tool_response": {
+   "stdout": "",
+   "stderr": "",
+   "interrupted": false,
+   "isImage": false,
+   "noOutputExpected": false,
+   "backgroundTaskId": "bxxxxxxxx"
+  },
+  "tool_use_id": "toolu_01",
+  "duration_ms": 27
+ },
+ "pre_bg_dup": {
+  "session_id": "{SID}",
+  "transcript_path": "/home/user/.claude/projects/-work/{SID}.jsonl",
+  "cwd": "{CWD}",
+  "prompt_id": "00000000-0000-4000-8000-000000000001",
+  "permission_mode": "bypassPermissions",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+   "command": "python3 -m http.server {PORT} --bind 127.0.0.1",
+   "run_in_background": true
+  },
+  "tool_use_id": "toolu_02"
+ },
+ "pre_nohup": {
+  "session_id": "{SID}",
+  "transcript_path": "/home/user/.claude/projects/-work/{SID}.jsonl",
+  "cwd": "{CWD}",
+  "prompt_id": "00000000-0000-4000-8000-000000000001",
+  "permission_mode": "bypassPermissions",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+   "command": "nohup python3 -m http.server {PORT} --bind 127.0.0.1 > /dev/null 2>&1 &"
+  },
+  "tool_use_id": "toolu_01"
+ },
+ "post_nohup": {
+  "session_id": "{SID}",
+  "transcript_path": "/home/user/.claude/projects/-work/{SID}.jsonl",
+  "cwd": "{CWD}",
+  "prompt_id": "00000000-0000-4000-8000-000000000001",
+  "permission_mode": "bypassPermissions",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+   "command": "nohup python3 -m http.server {PORT} --bind 127.0.0.1 > /dev/null 2>&1 &"
+  },
+  "tool_response": {
+   "stdout": "",
+   "stderr": "",
+   "interrupted": false,
+   "isImage": false,
+   "noOutputExpected": false
+  },
+  "tool_use_id": "toolu_01",
+  "duration_ms": 38
+ },
+ "pre_nohup_dup": {
+  "session_id": "{SID}",
+  "transcript_path": "/home/user/.claude/projects/-work/{SID}.jsonl",
+  "cwd": "{CWD}",
+  "prompt_id": "00000000-0000-4000-8000-000000000001",
+  "permission_mode": "bypassPermissions",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+   "command": "nohup python3 -m http.server {PORT} --bind 127.0.0.1 > /dev/null 2>&1 & "
+  },
+  "tool_use_id": "toolu_02"
+ },
+ "stop": {
+  "session_id": "{SID}",
+  "transcript_path": "/home/user/.claude/projects/-work/{SID}.jsonl",
+  "cwd": "{CWD}",
+  "prompt_id": "00000000-0000-4000-8000-000000000001",
+  "permission_mode": "bypassPermissions",
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "done",
+  "background_tasks": [
+   {
+    "id": "bxxxxxxxx",
+    "type": "shell",
+    "status": "running",
+    "description": "python3 -m http.server {PORT} --bind 127.0.0.1",
+    "command": "python3 -m http.server {PORT} --bind 127.0.0.1"
+   }
+  ],
+  "session_crons": []
+ },
+ "session_end": {
+  "session_id": "{SID}",
+  "transcript_path": "/home/user/.claude/projects/-work/{SID}.jsonl",
+  "cwd": "{CWD}",
+  "prompt_id": "00000000-0000-4000-8000-000000000001",
+  "hook_event_name": "SessionEnd",
+  "reason": "other"
+ }
+}

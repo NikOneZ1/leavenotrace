@@ -215,6 +215,37 @@ class Robustness(Base):
         # the "claude" process has exited -> its session is now crash-recovery material
         self.assertTrue(self.mod.start_token(int(pid)) is None)
 
+    def test_owner_from_claude_pid_env_when_process_name_is_unusual(self):
+        """Claude Code exports CLAUDE_PID to hooks; trust it only when it is really an ancestor."""
+        fake = os.path.join(self.fakebin, "weird-launcher-name")
+        with open(fake, "w") as f:
+            f.write("#!/usr/bin/env python3\nimport json, os, subprocess, sys\n"
+                    "cli, sid = sys.argv[1], sys.argv[2]\n"
+                    "env = dict(os.environ, CLAUDE_PID=os.environ.get('FAKE_CLAUDE_PID') or str(os.getpid()))\n"
+                    "p = {'session_id': sid, 'cwd': os.getcwd(), 'source': 'startup'}\n"
+                    "subprocess.run([sys.executable, cli, 'hook', 'session-start'], input=json.dumps(p), universal_newlines=True, "
+                    "stdout=subprocess.DEVNULL, env=env)\nprint(os.getpid())\n")
+        os.chmod(fake, 0o755)
+        env = dict(self.env)
+        env.pop("LEAVENOTRACE_OWNER_PID")
+        r = subprocess.run([sys.executable, fake, CLI, "cpid-sess"], env=env, cwd=self.work, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True)
+        self.assertEqual(self.registry("cpid-sess")["owner_pid"], int(r.stdout))
+        # a CLAUDE_PID that is NOT an ancestor (e.g. pid of some unrelated process) is ignored
+        other = self.spawn(["sleep", "60"])
+        env["FAKE_CLAUDE_PID"] = str(other.pid)
+        r = subprocess.run([sys.executable, fake, CLI, "cpid-sess2"], env=env, cwd=self.work, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True)
+        self.assertNotEqual(self.registry("cpid-sess2")["owner_pid"], other.pid)
+
+    def test_debug_payload_capture(self):
+        log = os.path.join(self.tmp, "payloads.jsonl")
+        self.hook("SessionStart", {"source": "startup"}, env={"LEAVENOTRACE_DEBUG_PAYLOADS": log})
+        rec = json.loads(open(log).readline())
+        self.assertEqual(rec["event"], "session-start")
+        self.assertEqual(json.loads(rec["raw"])["session_id"], self.sid)
+        self.assertTrue(rec["ppid_chain"])
+
     def test_gemini_adapter_translates_names_and_output(self):
         port, _ = self.start_agent_server()
         cmd = "python3 -m http.server %d &" % port

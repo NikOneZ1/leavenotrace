@@ -207,7 +207,7 @@ def _linux_proc(pid, with_cmd=True):
     return Proc(pid, ppid, token, _btime() + ticks / float(_clk()), argv, state)
 
 
-_PS_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.*)$")
+_PS_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.*)$")
 
 
 def _ps_epoch(s):
@@ -218,7 +218,8 @@ def _ps_epoch(s):
 
 
 def _ps_table(pid=None):
-    cmd = ["ps", "-axo", "pid=,ppid=,lstart=,command="] if pid is None else ["ps", "-o", "pid=,ppid=,lstart=,command=", "-p", str(pid)]
+    cmd = ["ps", "-axo", "pid=,ppid=,stat=,lstart=,command="] if pid is None else \
+        ["ps", "-o", "pid=,ppid=,stat=,lstart=,command=", "-p", str(pid)]
     e = dict(os.environ, LC_ALL="C", LANG="C")
     try:
         out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=e, timeout=10).stdout.decode("utf-8", "replace")
@@ -230,7 +231,8 @@ def _ps_table(pid=None):
         if not m:
             continue
         p = int(m.group(1))
-        res[p] = Proc(p, int(m.group(2)), re.sub(r"\s+", " ", m.group(3)), _ps_epoch(m.group(3)), m.group(4).split())
+        res[p] = Proc(p, int(m.group(2)), re.sub(r"\s+", " ", m.group(4)), _ps_epoch(m.group(4)), m.group(5).split(),
+                      m.group(3)[:1] or "S")
     return res
 
 
@@ -274,7 +276,7 @@ def start_token(pid):
             return None
         return "%s:%d" % (_boot_id(), st[2])
     p = _ps_table(pid).get(pid)
-    return p.start if p else None
+    return p.start if p and p.state not in ("Z", "X") else None
 
 
 def ancestors(pid, table=None):
@@ -381,10 +383,23 @@ def listening_ports(pids):
     return res
 
 
+def _lsof_port_pids(port):
+    """pids with a TCP LISTEN socket on `port` (macOS/BSD, via lsof; only sees our own user's processes)."""
+    try:
+        out = subprocess.run(["lsof", "-nP", "-iTCP:%d" % int(port), "-sTCP:LISTEN", "-Fp"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=8).stdout.decode()
+    except Exception:
+        return []
+    return [int(l[1:]) for l in out.splitlines() if l.startswith("p") and l[1:].isdigit()]
+
+
 def port_listener(port):
     """(pid, cmdline) of a process listening on port, best effort; None if unknown."""
     tab = list_processes()
-    lp = listening_ports(list(tab.keys())) if IS_LINUX else {}
+    if IS_LINUX:
+        lp = listening_ports(list(tab.keys()))
+    else:
+        lp = {pid: [port] for pid in _lsof_port_pids(port)}
     for pid, ports in lp.items():
         if port in ports:
             return pid, tab[pid].cmdline if pid in tab else ""
@@ -550,8 +565,11 @@ def find_owner():
     v = env("OWNER_PID")
     if v and v.isdigit():
         return int(v), start_token(int(v))
-    table = None
-    for pid in ancestors(os.getpid()):
+    anc = ancestors(os.getpid())
+    cp = os.environ.get("CLAUDE_PID", "")  # set by Claude Code for hook/Bash children (verified live); only trusted if an ancestor
+    if cp.isdigit() and int(cp) in anc and int(cp) > 1:
+        return int(cp), start_token(int(cp))
+    for pid in anc:
         p = get_proc(pid)
         if p and looks_like_agent(p) and not any(os.path.basename(x) == CLI_NAME for x in p.argv[:2]):
             return pid, p.start
@@ -1086,6 +1104,9 @@ def ports_in_text(text):
     return ports
 
 
+_INTERP_RE = re.compile(r"^(python|pypy)[0-9.]*$", re.I)
+
+
 def seg_matches_proc(seg, p):
     argv = seg["argv"]
     first = os.path.basename(argv[0])
@@ -1093,6 +1114,11 @@ def seg_matches_proc(seg, p):
         return False
     cl = p.cmdline
     idx = cl.find(first)
+    if idx < 0 and _INTERP_RE.match(first):
+        # macOS: `python3` (a Homebrew/pyenv shim or framework launcher) re-execs as ".../Python.app/Contents/MacOS/Python"
+        # so argv[0] of the live process no longer contains "python3"; accept any python-family executable name.
+        m = re.search(r"(?i)(?:^|/)(?:python|pypy)[0-9.]*(?=\s|$)", cl)
+        idx = m.start() if m else -1
     if idx < 0:
         return False
     for t in argv[1:]:
@@ -1423,7 +1449,7 @@ def hook_pre(hi, agent):
                                "" if mine else " in another agent session (%s)" % s_id, r["id"], r["pid"],
                                (", port %s" % ",".join(str(p) for p in pr)) if pr else "", r.get("cwd"), ago(r["opened_at"]),
                                (" at http://localhost:%s" % pr[0]) if pr else "", cli_hint(), r["id"], FORCE_MARKER))
-                elif not dup and s["port"] and IS_LINUX:
+                elif not dup and s["port"]:
                     pl = port_listener(s["port"])
                     if pl:
                         notes.append("port %s is already in use by pid %s (%s) which is NOT owned by %s; it will not be touched. "
@@ -1900,8 +1926,34 @@ HOOKS = {"pre-tool-use": hook_pre, "post-tool-use": hook_post, "stop": hook_stop
          "session-end": hook_session_end}
 
 
+def debug_capture(event, raw):
+    """Env DEBUG_PAYLOADS=/path/file.jsonl (with the usual env prefix): append the raw hook payload + process context (for bug reports/tests)."""
+    path = env("DEBUG_PAYLOADS")
+    if not path:
+        return
+    try:
+        chain = []
+        for pid in [os.getppid()] + ancestors(os.getppid())[:6]:
+            p = get_proc(pid)
+            chain.append({"pid": pid, "cmd": (p.cmdline[:160] if p else None)})
+        rec = {"ts": now(), "event": event, "raw": raw, "pid": os.getpid(), "ppid_chain": chain,
+               "env": {k: v for k, v in os.environ.items() if k.startswith("CLAUDE") and "KEY" not in k and "TOKEN" not in k}}
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
 def cmd_hook(a):
-    hi = read_stdin_json()
+    try:
+        raw = sys.stdin.read()
+    except Exception:
+        raw = ""
+    debug_capture(a.event, raw)
+    try:
+        hi = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        hi = {}
     fn = HOOKS.get(a.event)
     if not fn:
         return 0

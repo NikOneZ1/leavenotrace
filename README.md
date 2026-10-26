@@ -10,9 +10,10 @@ sweeps idle things, and closes everything the session owns when the task or sess
 
 *Working name.* The product name lives in one constant block (see [Renaming](#renaming)).
 
-* Primary target and the only thing exercised by the test-suite: **Claude Code hooks on Linux**.
-* v1 status: tested against simulated hook payloads and real child processes; **not yet run inside a live Claude
-  Code session** (see [Verified vs unverified](#verified-vs-unverified)).
+* Test-suite (105 tests, stdlib `unittest`, real child processes) passes on **Linux and macOS (arm64, Python 3.14)**.
+* Live-tested inside a **real Claude Code 2.1.280 binary on macOS** (hooks fire, server registered, duplicate denied, closed at
+  session end) - but with a scripted stand-in for the model, not a real Claude conversation (see
+  [Verified vs unverified](#verified-vs-unverified)).
 
 ## Why
 
@@ -174,15 +175,43 @@ rename, concurrency of registry writes, fail-open hooks.
 
 ## Verified vs unverified
 
-**Verified (by the test-suite, Linux):** everything in the Tests list above - 99 tests (one of them re-runs the whole suite in a renamed copy), 0 failures.
-**Verified against documentation only:** hook stdin/stdout JSON formats, `permissionDecision: "deny"` shape, `additionalContext`
-fields, SessionEnd budget/discarded output, Stop `additionalContext` continuing the turn, plugin layout (`.claude-plugin/plugin.json`,
-`hooks/hooks.json`, `bin/` on PATH), `${CLAUDE_PLUGIN_ROOT}` (code.claude.com/docs/en/hooks and /plugins-reference, fetched 2026-10-26).
+**Verified by the test-suite on Linux and on macOS (arm64, macOS 26, Homebrew Python 3.14):** everything in the Tests list above -
+105 tests (one of them re-runs the whole suite in a renamed copy), 0 failures on both. On macOS this exercised `ps`/`lsof` parsing
+(`lstart`, `stat`), cwd/port discovery via `lsof`, `/tmp -> /private/tmp` and `/var/folders` temp-root handling, process-tree
+kill/SIGTERM->SIGKILL, and the Homebrew `python3` -> `Python.app/Contents/MacOS/Python` re-exec (argv[0] no longer says `python3`).
+If `$HOME` itself is under a temp dir (e.g. `HOME=/tmp/x`), tests that need a real non-temp file fall back to refusal-only checks.
+
+**Verified live in a real Claude Code 2.1.280 on macOS** (`scripts/live/run_live.sh`, ~10 s, no Claude account used: the real `claude`
+binary talks to `scripts/live/mock_api.py`, a scripted local stand-in for the Messages API via `ANTHROPIC_BASE_URL`, with throwaway
+`HOME` and `LEAVENOTRACE_HOME`, plugin loaded with `--plugin-dir`, `--setting-sources project,local`):
+* `claude plugin validate <dir>` -> "Validation passed" (no manifest/hook-format problems).
+* All five hook events fire from the plugin's `hooks/hooks.json`; hooks run with `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PID` etc. set.
+* `python3 -m http.server 8765` via Bash with `run_in_background: true`, and via `nohup ... &`: registered right after the tool call
+  (`registered proc-1 (pid .., port 8765)` shown as PostToolUse context); the identical second start is **denied** with the reuse message
+  (Claude Code returns it as an `is_error` tool_result carrying our `permissionDecisionReason`).
+* Session end: `-p` mode ends -> SessionEnd fires (`reason: "other"`) -> the detached cleaner closes the server. For
+  `run_in_background` Claude Code itself already kills its background task at exit, so the registry records "gone nothing to kill"; for
+  `nohup ... &` (which escapes the harness) LeaveNoTrace is what closes it (`closed pids [..]`); no server process remained afterwards.
+* Real payloads are captured in `tests/fixtures/claude_code_2_1_280_hooks.json` (anonymised) and replayed by
+  `tests/test_real_payloads.py`. Differences from what the code was written against: extra fields (`prompt_id`, `permission_mode`,
+  `duration_ms`, Bash `tool_response.backgroundTaskId/isImage/noOutputExpected`, Stop `last_assistant_message/background_tasks/session_crons`,
+  SessionEnd `reason`) - all ignored harmlessly; no code change was needed for them. One addition from the capture: owner detection
+  now also uses the `CLAUDE_PID` env var Claude Code exports to hooks (accepted only if it is a real ancestor of the hook).
+* `LEAVENOTRACE_DEBUG_PAYLOADS=/path/file.jsonl` records raw hook payloads + parent-process chain for bug reports.
+
+**Verified against documentation only:** hook stdin/stdout JSON formats not exercised above (Stop `additionalContext` continuing the turn,
+SessionEnd budget when Claude Code is closed interactively), `${CLAUDE_PLUGIN_ROOT}` in marketplace installs (code.claude.com/docs/en/hooks
+and /plugins-reference, fetched 2026-10-26).
 
 **Unverified - treat as such:**
-* A real Claude Code session (hooks firing in practice, real `run_in_background` timing, real `tool_response` shapes, how
-  quickly Bash-started servers get reparented). `claude plugin validate` was not run (no `claude` binary in the build environment).
-* macOS: code paths for `ps lstart`/`lsof` exist but were never executed.
+* A **real model-driven** Claude Code conversation: the live run used a scripted model stub (the user's Claude login had an expired OAuth
+  session, so it was not used). How a real model words Bash commands (compound commands, `cd x && npm run dev &`, `npm run dev` without `&`)
+  against the analyzer is only covered by unit tests. Interactive (TUI) sessions, `/exit`, Ctrl-C, terminal close and crash recovery on
+  a real machine were not tried live; `--resume`/`--continue` neither.
+* Installing from a marketplace (`/plugin install`) and `leavenotrace install` (manual hooks) against a real `~/.claude/settings.json`
+  were not run (only the `--plugin-dir` route and the unit-tested install against a temp HOME).
+* macOS: only the Homebrew python3 / macOS 26 arm64 combination; Intel Macs, system `/usr/bin/python3` (3.9), older macOS, and
+  `lsof` being slow on very busy machines are untested. Zombie handling uses the `stat` column of `ps`.
 * Real Playwright MCP / Chrome DevTools MCP / Claude-in-Chrome responses: parsers are written from public source/docs and unit-tested
   with synthetic strings; the Claude-in-Chrome handling is a generic guess (tab id regex, ungroup note).
 * Real iOS simulators (`xcrun` is mocked); `xcodebuild`-implicit boots and `open -a Simulator` are not detected.
@@ -216,5 +245,6 @@ python3 -m unittest discover -s tests                         # the renamed copy
 .claude-plugin/plugin.json  hooks/hooks.json  skills/cleanup/SKILL.md  commands/leavenotrace.md
 bin/leavenotrace            (the CLI + hook handlers; single file)
 adapters/                   AGENTS.md snippet, Codex + Gemini hook examples (untested), Cursor notes
-scripts/                    demo.sh  rename.py  package.py      tests/   LICENSE (MIT)
+scripts/                    demo.sh  rename.py  package.py  live/ (real-Claude-Code test: run_live.sh, mock_api.py)
+tests/  (incl. fixtures/ = real hook payloads)   LICENSE (MIT)
 ```
