@@ -1,0 +1,9 @@
+{
+  "name": "leavenotrace",
+  "displayName": "LeaveNoTrace",
+  "version": "1.0.0",
+  "description": "Agents close what they open (dev servers, browser tabs, iOS simulators, temp files) and reuse what is already open. Tracks only what this session opened.",
+  "author": { "name": "V3rba Verba" },
+  "license": "MIT",
+  "keywords": ["cleanup", "processes", "dev-server", "browser", "simulator", "hooks", "hygiene"]
+}

@@ -1,0 +1,17 @@
+{
+  "_comment": "UNTESTED. Merge the \"hooks\" object into ~/.gemini/settings.json (Gemini CLI hooks: https://geminicli.com/docs/hooks/). Replace /ABS/PATH/TO. `--agent gemini` maps run_shell_command->Bash, write_file->Write and emits Gemini's {decision:deny,reason} format. Gemini timeouts are in milliseconds. Gemini has no per-turn Stop event wired here, so run `leavenotrace sweep` yourself (or from cron) for idle cleanup. Never exercised against a real Gemini CLI.",
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "name": "leavenotrace-start", "command": "python3 /ABS/PATH/TO/leavenotrace/bin/leavenotrace hook session-start --agent gemini" } ] }
+    ],
+    "BeforeTool": [
+      { "matcher": "run_shell_command|write_file", "hooks": [ { "type": "command", "name": "leavenotrace-pre", "command": "python3 /ABS/PATH/TO/leavenotrace/bin/leavenotrace hook pre-tool-use --agent gemini" } ] }
+    ],
+    "AfterTool": [
+      { "matcher": "run_shell_command|write_file", "hooks": [ { "type": "command", "name": "leavenotrace-post", "command": "python3 /ABS/PATH/TO/leavenotrace/bin/leavenotrace hook post-tool-use --agent gemini" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "name": "leavenotrace-end", "command": "python3 /ABS/PATH/TO/leavenotrace/bin/leavenotrace hook session-end --agent gemini", "timeout": 3000 } ] }
+    ]
+  }
+}

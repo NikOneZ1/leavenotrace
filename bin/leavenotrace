@@ -1,0 +1,2370 @@
+#!/usr/bin/env python3
+"""LeaveNoTrace - make coding agents close what they open and reuse what is already open.
+
+Single-file, dependency-free (Python 3.8+ stdlib only). Works on Linux and macOS.
+
+    leavenotrace list | status | close | keep | release | sweep | doctor
+                 register | forget | tmpdir | install | uninstall
+    leavenotrace hook <event>      (internal: Claude Code / Gemini / Codex hooks)
+
+RENAMING: change the constants in the "IDENTITY" block below (or run
+scripts/rename.py). Nothing else in this file hard-codes the product name.
+"""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+# ----------------------------------------------------------------------------
+# IDENTITY - the single place that defines the product name.
+# ----------------------------------------------------------------------------
+PLUGIN_NAME = "leavenotrace"        # plugin.json "name", skill/command namespace
+DISPLAY_NAME = "LeaveNoTrace"       # human-readable name used in messages
+CLI_NAME = "leavenotrace"           # file name of this script in bin/
+STATE_DIRNAME = ".leavenotrace"     # ~/<STATE_DIRNAME>  (override: <ENV_PREFIX>_HOME)
+ENV_PREFIX = "LEAVENOTRACE"         # env vars: <ENV_PREFIX>_HOME, _SESSION_ID, ...
+FORCE_MARKER = "leavenotrace:force"  # `# leavenotrace:force` in a command overrides denials
+# ----------------------------------------------------------------------------
+
+VERSION = "1.0.0"
+SCRIPT_PATH = os.path.abspath(__file__)
+
+DEFAULT_CONFIG = {
+    "idle_ttl_minutes": 30,      # Stop-hook idle sweep; 0 disables
+    "grace_seconds": 3.0,        # SIGTERM -> SIGKILL wait
+    "stop_nudge": True,          # Stop hook may ask the agent to close expired tabs
+    "session_end_wait_ms": 600,  # how long the SessionEnd hook waits for the detached cleaner
+    "port_wait_seconds": 2.0,    # PostToolUse waits this long for a declared port to listen
+    "orphan_hours": 24,          # sessions with unknown owner pid are swept after this age
+    "prune_days": 7,             # forget ended session files after this many days
+}
+
+
+def env(name, default=None):
+    return os.environ.get("%s_%s" % (ENV_PREFIX, name), default)
+
+
+def now():
+    return time.time()
+
+
+def iso(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts))
+
+
+def ago(ts):
+    if not ts:
+        return "?"
+    d = max(0, int(now() - ts))
+    if d < 90:
+        return "%ds" % d
+    if d < 5400:
+        return "%dm" % (d // 60)
+    return "%.1fh" % (d / 3600.0)
+
+
+def state_dir():
+    d = env("HOME") or os.path.join(os.path.expanduser("~"), STATE_DIRNAME)
+    return os.path.abspath(d)
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    p = os.path.join(state_dir(), "config.json")
+    try:
+        with open(p) as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    for k, typ in (("idle_ttl_minutes", float), ("grace_seconds", float), ("session_end_wait_ms", float),
+                   ("port_wait_seconds", float), ("orphan_hours", float), ("prune_days", float)):
+        v = env(k.upper())
+        if v is not None:
+            try:
+                cfg[k] = typ(v)
+            except ValueError:
+                pass
+    v = env("STOP_NUDGE")
+    if v is not None:
+        cfg["stop_nudge"] = v.lower() not in ("0", "false", "no", "off", "")
+    return cfg
+
+
+def log(msg):
+    try:
+        d = state_dir()
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, "%s.log" % PLUGIN_NAME)
+        if os.path.exists(p) and os.path.getsize(p) > 512 * 1024:
+            os.replace(p, p + ".1")
+        with open(p, "a") as f:
+            f.write("%s [%d] %s\n" % (iso(now()), os.getpid(), msg))
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------------
+# Process inspection (Linux /proc, macOS ps/lsof)
+# ----------------------------------------------------------------------------
+IS_LINUX = os.path.isdir("/proc/self") and os.path.exists("/proc/self/stat")
+_CLK = None
+_BTIME = None
+_BOOT = None
+
+
+def _clk():
+    global _CLK
+    if _CLK is None:
+        try:
+            _CLK = os.sysconf("SC_CLK_TCK")
+        except Exception:
+            _CLK = 100
+    return _CLK
+
+
+def _btime():
+    global _BTIME
+    if _BTIME is None:
+        _BTIME = 0
+        try:
+            with open("/proc/stat") as f:
+                for line in f:
+                    if line.startswith("btime"):
+                        _BTIME = int(line.split()[1])
+        except Exception:
+            pass
+    return _BTIME
+
+
+def _boot_id():
+    global _BOOT
+    if _BOOT is None:
+        try:
+            with open("/proc/sys/kernel/random/boot_id") as f:
+                _BOOT = f.read().strip()[:8]
+        except Exception:
+            _BOOT = "noboot"
+    return _BOOT
+
+
+class Proc(object):
+    __slots__ = ("pid", "ppid", "start", "epoch", "argv", "state")
+
+    def __init__(self, pid, ppid, start, epoch, argv, state="S"):
+        self.pid, self.ppid, self.start, self.epoch, self.argv, self.state = pid, ppid, start, epoch, argv, state
+
+    @property
+    def cmdline(self):
+        return " ".join(self.argv)
+
+
+def _linux_stat(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            data = f.read()
+    except Exception:
+        return None
+    try:
+        rp = data.rindex(")")
+        rest = data[rp + 2:].split()
+        state, ppid, ticks = rest[0], int(rest[1]), int(rest[19])
+        return state, ppid, ticks
+    except Exception:
+        return None
+
+
+def _linux_proc(pid, with_cmd=True):
+    st = _linux_stat(pid)
+    if not st:
+        return None
+    state, ppid, ticks = st
+    argv = []
+    if with_cmd:
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                raw = f.read()
+            argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+        except Exception:
+            argv = []
+        if not argv:
+            try:
+                with open("/proc/%d/comm" % pid) as f:
+                    argv = ["[%s]" % f.read().strip()]
+            except Exception:
+                argv = []
+    token = "%s:%d" % (_boot_id(), ticks)
+    return Proc(pid, ppid, token, _btime() + ticks / float(_clk()), argv, state)
+
+
+_PS_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.*)$")
+
+
+def _ps_epoch(s):
+    try:
+        return time.mktime(time.strptime(re.sub(r"\s+", " ", s), "%a %b %d %H:%M:%S %Y"))
+    except Exception:
+        return 0.0
+
+
+def _ps_table(pid=None):
+    cmd = ["ps", "-axo", "pid=,ppid=,lstart=,command="] if pid is None else ["ps", "-o", "pid=,ppid=,lstart=,command=", "-p", str(pid)]
+    e = dict(os.environ, LC_ALL="C", LANG="C")
+    try:
+        out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=e, timeout=10).stdout.decode("utf-8", "replace")
+    except Exception:
+        return {}
+    res = {}
+    for line in out.splitlines():
+        m = _PS_RE.match(line)
+        if not m:
+            continue
+        p = int(m.group(1))
+        res[p] = Proc(p, int(m.group(2)), re.sub(r"\s+", " ", m.group(3)), _ps_epoch(m.group(3)), m.group(4).split())
+    return res
+
+
+def list_processes():
+    if IS_LINUX:
+        tab = {}
+        for name in os.listdir("/proc"):
+            if name.isdigit():
+                p = _linux_proc(int(name))
+                if p:
+                    tab[p.pid] = p
+        return tab
+    return _ps_table()
+
+
+def get_proc(pid):
+    if pid is None:
+        return None
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if IS_LINUX:
+        return _linux_proc(pid)
+    return _ps_table(pid).get(pid)
+
+
+def start_token(pid):
+    """Opaque process-identity token (changes if the PID is reused). None if not alive."""
+    if pid is None:
+        return None
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    if IS_LINUX:
+        st = _linux_stat(pid)
+        if not st or st[0] in ("Z", "X"):
+            return None
+        return "%s:%d" % (_boot_id(), st[2])
+    p = _ps_table(pid).get(pid)
+    return p.start if p else None
+
+
+def ancestors(pid, table=None):
+    """PIDs of all ancestors of pid (excluding pid itself)."""
+    res = []
+    seen = set()
+    cur = pid
+    while cur and cur not in seen and len(res) < 64:
+        seen.add(cur)
+        if table is not None:
+            p = table.get(cur)
+        else:
+            p = get_proc(cur)
+        if not p or not p.ppid or p.ppid in seen:
+            break
+        res.append(p.ppid)
+        cur = p.ppid
+    return res
+
+
+def descendants(root, table):
+    kids = {}
+    for p in table.values():
+        kids.setdefault(p.ppid, []).append(p.pid)
+    out, stack = [], [root]
+    while stack:
+        c = stack.pop()
+        for k in kids.get(c, ()):
+            if k not in out and k != root:
+                out.append(k)
+                stack.append(k)
+    return out
+
+
+def proc_cwd(pid):
+    if IS_LINUX:
+        try:
+            return os.readlink("/proc/%d/cwd" % pid)
+        except Exception:
+            return None
+    try:
+        out = subprocess.run(["lsof", "-a", "-d", "cwd", "-p", str(pid), "-Fn"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=5).stdout.decode()
+        for line in out.splitlines():
+            if line.startswith("n"):
+                return line[1:]
+    except Exception:
+        pass
+    return None
+
+
+def listening_ports(pids):
+    """{pid: [ports]} for TCP LISTEN sockets owned by pids."""
+    pids = list(pids)
+    res = {}
+    if not pids:
+        return res
+    if IS_LINUX:
+        inode_port = {}
+        for fn in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                with open(fn) as f:
+                    next(f, None)
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) > 9 and parts[3] == "0A":
+                            inode_port[parts[9]] = int(parts[1].rsplit(":", 1)[1], 16)
+            except Exception:
+                pass
+        if not inode_port:
+            return res
+        for pid in pids:
+            try:
+                fds = os.listdir("/proc/%d/fd" % pid)
+            except Exception:
+                continue
+            for fd in fds:
+                try:
+                    t = os.readlink("/proc/%d/fd/%s" % (pid, fd))
+                except Exception:
+                    continue
+                if t.startswith("socket:["):
+                    port = inode_port.get(t[8:-1])
+                    if port:
+                        res.setdefault(pid, [])
+                        if port not in res[pid]:
+                            res[pid].append(port)
+        return res
+    try:
+        out = subprocess.run(["lsof", "-nP", "-a", "-p", ",".join(str(p) for p in pids), "-iTCP", "-sTCP:LISTEN", "-Fpn"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8).stdout.decode()
+    except Exception:
+        return res
+    cur = None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            cur = int(line[1:])
+        elif line.startswith("n") and cur is not None:
+            m = re.search(r":(\d+)$", line)
+            if m:
+                res.setdefault(cur, [])
+                if int(m.group(1)) not in res[cur]:
+                    res[cur].append(int(m.group(1)))
+    return res
+
+
+def port_listener(port):
+    """(pid, cmdline) of a process listening on port, best effort; None if unknown."""
+    tab = list_processes()
+    lp = listening_ports(list(tab.keys())) if IS_LINUX else {}
+    for pid, ports in lp.items():
+        if port in ports:
+            return pid, tab[pid].cmdline if pid in tab else ""
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Registry
+# ----------------------------------------------------------------------------
+def safe_sid(sid):
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(sid))[:120] or "unknown"
+
+
+class Store(object):
+    def __init__(self, root=None):
+        self.root = root or state_dir()
+        self.sdir = os.path.join(self.root, "sessions")
+
+    def path(self, sid):
+        return os.path.join(self.sdir, safe_sid(sid) + ".json")
+
+    def tmp_root(self):
+        return os.path.join(self.root, "tmp")
+
+    def tmpdir_for(self, sid):
+        return os.path.join(self.tmp_root(), safe_sid(sid))
+
+    def sessions(self):
+        try:
+            return sorted(f[:-5] for f in os.listdir(self.sdir) if f.endswith(".json"))
+        except Exception:
+            return []
+
+    def read(self, sid):
+        try:
+            with open(self.path(sid)) as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else None
+        except Exception:
+            return None
+
+    @contextlib.contextmanager
+    def txn(self, sid, create=None):
+        """Locked read-modify-write. create: dict of defaults for a new session (None => must exist)."""
+        os.makedirs(self.sdir, exist_ok=True)
+        lockp = self.path(sid) + ".lock"
+        with open(lockp, "a+") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                d = self.read(sid)
+                if d is None:
+                    if create is None:
+                        yield None
+                        return
+                    d = new_session(sid, **create)
+                yield d
+                d["updated_at"] = now()
+                self._write(sid, d)
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+
+    def _write(self, sid, d):
+        p = self.path(sid)
+        fd, tmp = tempfile.mkstemp(prefix=".w-", dir=self.sdir)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(d, f, indent=1, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, p)
+        except Exception:
+            with contextlib.suppress(Exception):
+                os.unlink(tmp)
+            raise
+
+    def delete(self, sid):
+        for p in (self.path(sid), self.path(sid) + ".lock"):
+            with contextlib.suppress(Exception):
+                os.unlink(p)
+
+
+def new_session(sid, owner_pid=None, owner_start=None, cwd=None, agent="claude"):
+    return {"version": 1, "session_id": sid, "agent": agent, "owner_pid": owner_pid, "owner_start": owner_start,
+            "cwd": cwd, "created_at": now(), "updated_at": now(), "ended": False, "counters": {},
+            "resources": {}, "pending": {}, "browsers": {}}
+
+
+PREFIX = {"process": "proc", "browser_tab": "tab", "browser_process": "browser", "simulator": "sim",
+          "temp_file": "file", "temp_dir": "tmpdir"}
+OPEN_STATES = ("open", "pending_close")
+
+
+def add_resource(d, rtype, **fields):
+    pre = PREFIX[rtype]
+    n = d["counters"].get(pre, 0) + 1
+    d["counters"][pre] = n
+    rid = "%s-%d" % (pre, n)
+    t = now()
+    r = {"id": rid, "type": rtype, "state": "open", "opened_at": t, "last_used_at": t, "keep_alive": False,
+         "pid": None, "pid_start": None, "children": [], "command": None, "command_norm": None, "cwd": None,
+         "port": None, "ports": [], "url": None, "tab_ref": None, "tab_ref_kind": None, "server": None,
+         "tool_prefix": None, "udid": None, "owned": True, "path": None, "note": None}
+    r.update(fields)
+    d["resources"][rid] = r
+    return r
+
+
+def open_resources(d, rtype=None):
+    return [r for r in d["resources"].values() if r["state"] in OPEN_STATES and (rtype is None or r["type"] == rtype)]
+
+
+def proc_alive(r):
+    """True only if r['pid'] is alive AND its start token still matches the registry."""
+    return bool(r.get("pid")) and r.get("pid_start") is not None and start_token(r["pid"]) == r["pid_start"]
+
+
+def resolve_id(d, ident):
+    if ident in d["resources"]:
+        return d["resources"][ident]
+    m = [r for k, r in d["resources"].items() if k.startswith(ident)]
+    return m[0] if len(m) == 1 else None
+
+
+def describe(r):
+    t = r["type"]
+    if t in ("process", "browser_process"):
+        extra = "pid %s" % r["pid"]
+        ports = r.get("ports") or ([r["port"]] if r.get("port") else [])
+        if ports:
+            extra += ", port %s" % ",".join(str(p) for p in ports)
+        extra += ", cwd %s, cmd: %s" % (r.get("cwd"), (r.get("command") or "")[:80])
+    elif t == "browser_tab":
+        extra = "%s tab %s=%s, url %s" % (r.get("server"), r.get("tab_ref_kind"), r.get("tab_ref"), r.get("url"))
+    elif t == "simulator":
+        extra = "udid %s%s" % (r.get("udid"), "" if r.get("owned") else " (NOT owned - never shut down)")
+    else:
+        extra = r.get("path") or ""
+    return "%s [%s%s] %s  (opened %s ago, used %s ago%s)" % (
+        r["id"], r["state"], ", keep" if r.get("keep_alive") else "", extra, ago(r["opened_at"]),
+        ago(r["last_used_at"]), "")
+
+
+# ----------------------------------------------------------------------------
+# Identity of the agent process that owns a session, protection set
+# ----------------------------------------------------------------------------
+_AGENT_ARG = re.compile(r"(^|/)(claude|codex|gemini)(-code|-cli)?(\.js|\.cjs|\.mjs)?$")
+
+
+def looks_like_agent(p):
+    if not p or not p.argv:
+        return False
+    base0 = os.path.basename(p.argv[0]).lower()
+    if base0 in ("claude", "claude-code", "codex", "gemini"):
+        return True
+    for a in p.argv[:3]:
+        if _AGENT_ARG.search(a) or "@anthropic-ai/claude-code" in a or "@openai/codex" in a or "gemini-cli" in a:
+            return True
+    return False
+
+
+def find_owner():
+    """(pid, start_token) of the agent process that spawned us, or (None, None)."""
+    v = env("OWNER_PID")
+    if v and v.isdigit():
+        return int(v), start_token(int(v))
+    table = None
+    for pid in ancestors(os.getpid()):
+        p = get_proc(pid)
+        if p and looks_like_agent(p) and not any(os.path.basename(x) == CLI_NAME for x in p.argv[:2]):
+            return pid, p.start
+    return None, None
+
+
+def protect_set(extra=()):
+    s = {0, 1, os.getpid()} | set(extra)
+    s |= set(ancestors(os.getpid()))
+    return s
+
+
+def parse_protect(arg):
+    out = set()
+    for tok in (arg or "").split(","):
+        tok = tok.strip()
+        if tok.isdigit():
+            out.add(int(tok))
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Safe closing
+# ----------------------------------------------------------------------------
+def _alive_token(table, pid, token):
+    p = table.get(pid)
+    return bool(p and p.start == token and p.state not in ("Z", "X"))
+
+
+def safe_kill_tree(r, protect, grace=3.0, dry_run=False):
+    """Kill the registered process (and its descendants / recorded children) with identity checks.
+
+    Fails closed: if the registered PID now has a different start token (PID reuse) nothing is killed.
+    Never signals process groups, never matches by port or name.
+    """
+    res = {"result": None, "killed": [], "skipped": [], "reason": ""}
+    pid, want = r.get("pid"), r.get("pid_start")
+    if not pid or not want:
+        res.update(result="refused", reason="registry entry has no pid/start-time")
+        return res
+    pid = int(pid)
+    table = list_processes()
+    cur = table.get(pid)
+    root_ok = False
+    if cur is None or cur.state in ("Z", "X"):
+        pass
+    elif cur.start != want:
+        res.update(result="refused", reason="pid %d now has a different start time (PID reuse?) - not touching it" % pid)
+        return res
+    else:
+        root_ok = True
+    prot = set(protect) | protect_set()
+    prot |= set(ancestors(os.getpid(), table))
+    if root_ok and (pid in prot or looks_like_agent(cur)):
+        res.update(result="refused", reason="pid %d is protected (agent process or ancestor of this command)" % pid)
+        return res
+    targets = []  # parents first
+    toks = {}
+    if root_ok:
+        targets.append(pid)
+        toks[pid] = cur.start
+        for c in descendants(pid, table):
+            if c in table and table[c].state not in ("Z", "X"):
+                targets.append(c)
+                toks[c] = table[c].start
+    for ch in r.get("children") or []:
+        try:
+            cp = table.get(int(ch["pid"]))
+        except Exception:
+            continue
+        if cp and cp.start == ch.get("start") and cp.state not in ("Z", "X") and cp.pid not in toks:
+            targets.append(cp.pid)
+            toks[cp.pid] = cp.start
+    final = []
+    for t in targets:
+        if t in prot or looks_like_agent(table.get(t)):
+            res["skipped"].append(t)
+        else:
+            final.append(t)
+    if not final:
+        res.update(result="gone" if not res["skipped"] else "refused",
+                   reason="nothing to kill" if not res["skipped"] else "only protected pids left")
+        return res
+    if dry_run:
+        res.update(result="dry-run", killed=list(final), reason="would kill %s" % final)
+        return res
+
+    def send(sig, pids):
+        for t in pids:
+            cur2 = get_proc(t)
+            # re-verify identity immediately before every signal
+            if cur2 is None or cur2.start != toks[t] or cur2.state in ("Z", "X"):
+                continue
+            try:
+                os.kill(t, sig)
+                if t not in res["killed"]:
+                    res["killed"].append(t)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                res["skipped"].append(t)
+
+    def alive(pids):
+        return [t for t in pids if start_token(t) == toks[t]]
+
+    send(signal.SIGTERM, list(reversed(final)))  # leaves first
+    deadline = time.time() + max(0.0, grace)
+    left = alive(final)
+    while left and time.time() < deadline:
+        time.sleep(0.05)
+        left = alive(final)
+    if left:
+        send(signal.SIGKILL, left)
+        d2 = time.time() + 1.5
+        while left and time.time() < d2:
+            time.sleep(0.05)
+            left = alive(final)
+    if left:
+        res.update(result="failed", reason="still alive after SIGKILL: %s" % left)
+    else:
+        res.update(result="closed")
+    return res
+
+
+def temp_roots(store):
+    roots = set()
+    cands = [tempfile.gettempdir(), "/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp", os.environ.get("TMPDIR"),
+             store.tmp_root()]
+    for c in cands:
+        if c:
+            with contextlib.suppress(Exception):
+                roots.add(os.path.realpath(c).rstrip("/"))
+    return roots
+
+
+TMP_MARKER_DIR = ".agent-tmp"
+
+
+def is_temp_path(store, path, scratch=None):
+    """True if path is a strict descendant of a temp root (or under a .agent-tmp dir). Never the root itself."""
+    if not path or not os.path.isabs(path):
+        return False
+    norm = os.path.normpath(path)
+    if norm != path.rstrip("/") and ".." in path.split("/"):
+        return False
+    real = os.path.join(os.path.realpath(os.path.dirname(norm)), os.path.basename(norm))
+    if scratch:
+        sr = os.path.realpath(scratch).rstrip("/")
+        if real.startswith(sr + "/") or real == sr:
+            return False
+    if re.search(r"/claude-\d+(/|$)", real):
+        return False  # the agent's own scratch area
+    if TMP_MARKER_DIR in real.split("/")[:-1]:
+        return True
+    for root in temp_roots(store):
+        if real.startswith(root + "/") and real != root:
+            return True
+    return False
+
+
+def safe_remove_file(store, path):
+    if not is_temp_path(store, path):
+        return "refused", "path is not under a temp root: %s" % path
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "closed", "already gone"
+    import stat as _st
+    if _st.S_ISDIR(st.st_mode):
+        return "refused", "is a directory"
+    try:
+        os.unlink(path)  # symlinks: removes the link only
+        return "closed", "deleted"
+    except Exception as e:
+        return "failed", str(e)
+
+
+def safe_remove_dir(store, sid, path):
+    exp = store.tmpdir_for(sid)
+    if os.path.abspath(path) != os.path.abspath(exp) or os.path.islink(path):
+        return "refused", "not this session's tmpdir"
+    if not os.path.realpath(path).startswith(os.path.realpath(store.tmp_root()) + "/"):
+        return "refused", "outside tmp root"
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        return "closed", "already gone"
+    except Exception as e:
+        return "failed", str(e)
+    return "closed", "removed"
+
+
+# --- simulators ---------------------------------------------------------------
+UDID_RE = re.compile(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")
+
+
+def sim_list():
+    """list of dicts {udid,name,state,runtime} or None if simctl unavailable."""
+    xc = shutil.which("xcrun")
+    if not xc:
+        return None
+    try:
+        out = subprocess.run([xc, "simctl", "list", "devices", "-j"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=8).stdout.decode()
+        data = json.loads(out)
+    except Exception:
+        return None
+    res = []
+    for runtime, devs in (data.get("devices") or {}).items():
+        for dv in devs:
+            if dv.get("isAvailable", True):
+                res.append({"udid": dv.get("udid"), "name": dv.get("name"), "state": dv.get("state"),
+                            "runtime": runtime.rsplit(".", 1)[-1]})
+    return res
+
+
+def sim_booted():
+    lst = sim_list()
+    return None if lst is None else [d for d in lst if d["state"] == "Booted"]
+
+
+def sim_shutdown(udid):
+    if not UDID_RE.match(udid or ""):
+        return "refused", "invalid udid"
+    booted = sim_booted()
+    if booted is None:
+        return "failed", "xcrun/simctl unavailable"
+    if udid not in [d["udid"] for d in booted]:
+        return "closed", "not booted any more"
+    xc = shutil.which("xcrun")
+    try:
+        p = subprocess.run([xc, "simctl", "shutdown", udid], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    except Exception as e:
+        return "failed", str(e)
+    if p.returncode != 0 and "current state: Shutdown" not in p.stderr.decode("utf-8", "replace"):
+        return "failed", p.stderr.decode("utf-8", "replace")[:200]
+    return "closed", "shut down %s" % udid
+
+
+# --- browser tabs -------------------------------------------------------------
+def tab_close_instructions(r):
+    pre = r.get("tool_prefix") or "mcp__<browser-server>__"
+    ref, kind, url = r.get("tab_ref"), r.get("tab_ref_kind"), r.get("url")
+    srv = (r.get("server") or "")
+    if srv == "devtools":
+        if ref is not None:
+            return '%sclose_page {"pageId": %s}   (tab was %s)' % (pre, ref, url)
+        return "%slist_pages, find the page with URL %s, then %sclose_page {\"pageId\": <id>}" % (pre, url, pre)
+    if srv == "playwright":
+        tool = "browser_tabs" if True else ""
+        if ref is not None:
+            return ('%s%s {"action": "list"} to confirm, then %s%s {"action": "close", "index": %s}   (tab was %s)'
+                    % (pre, tool, pre, tool, ref, url))
+        return "%sbrowser_tabs {\"action\": \"list\"}, find URL %s, then close that index" % (pre, url)
+    return ("close the tab with %s=%s (url %s) using the browser tool's tab-close action. For Claude in Chrome, ungroup the "
+            "tab from its tab group first (a grouped tab can leave an empty group chip behind)." % (kind, ref, url))
+
+
+def close_resource(store, sid, r, protect, grace, dry_run=False, killed_servers=()):
+    """Close one resource snapshot. Returns (new_state, message). Never raises."""
+    try:
+        t = r["type"]
+        if t in ("process", "browser_process"):
+            res = safe_kill_tree(r, protect, grace, dry_run)
+            msg = "%s %s" % (res["result"], res["reason"] or ("pids %s" % res["killed"]))
+            if res["result"] in ("closed", "gone"):
+                return "closed", msg
+            if res["result"] == "dry-run":
+                return r["state"], msg
+            if res["result"] == "refused":
+                return "refused", msg
+            return r["state"], msg
+        if t == "browser_tab":
+            if r.get("server") in killed_servers:
+                return "closed", "browser process was closed"
+            return "pending_close", "agent must close it: " + tab_close_instructions(r)
+        if t == "simulator":
+            if not r.get("owned"):
+                return "released", "not owned by this session - left running"
+            if dry_run:
+                return r["state"], "would shut down %s" % r.get("udid")
+            s, m = sim_shutdown(r.get("udid"))
+            return ("closed" if s == "closed" else ("refused" if s == "refused" else r["state"])), m
+        if t == "temp_file":
+            if dry_run:
+                return r["state"], "would delete %s" % r.get("path")
+            s, m = safe_remove_file(store, r.get("path"))
+            return ("closed" if s == "closed" else ("refused" if s == "refused" else r["state"])), m
+        if t == "temp_dir":
+            if dry_run:
+                return r["state"], "would remove %s" % r.get("path")
+            s, m = safe_remove_dir(store, sid, r.get("path"))
+            return ("closed" if s == "closed" else ("refused" if s == "refused" else r["state"])), m
+    except Exception as e:  # pragma: no cover
+        log("close_resource error %r: %s" % (r.get("id"), e))
+        return r["state"], "error: %s" % e
+    return r["state"], "unknown type"
+
+
+CLOSE_ORDER = {"process": 0, "browser_process": 0, "browser_tab": 1, "simulator": 2, "temp_file": 3, "temp_dir": 4}
+
+
+def close_resources(store, sid, ids=None, protect=(), grace=None, dry_run=False, except_kept=False, only_idle_ttl=None):
+    """Close resources of a session. ids=None => every open one. Returns [(id, state, message)]."""
+    cfg = load_config()
+    grace = cfg["grace_seconds"] if grace is None else grace
+    snap = store.read(sid)
+    if not snap:
+        return []
+    chosen = []
+    for r in snap["resources"].values():
+        if r["state"] not in OPEN_STATES:
+            continue
+        if ids is not None and r["id"] not in ids:
+            continue
+        if except_kept and r.get("keep_alive"):
+            continue
+        if only_idle_ttl is not None:
+            if r.get("keep_alive") or now() - r["last_used_at"] < only_idle_ttl:
+                continue
+        chosen.append(r)
+    chosen.sort(key=lambda r: CLOSE_ORDER.get(r["type"], 9))
+    prot = set(protect) | protect_set()
+    if snap.get("owner_pid"):
+        prot.add(int(snap["owner_pid"]))
+    results = []
+    killed_servers = set()
+    for r in chosen:
+        st, msg = close_resource(store, sid, r, prot, grace, dry_run, killed_servers)
+        if r["type"] == "browser_process" and st == "closed":
+            killed_servers.add(r.get("server"))
+        results.append((r["id"], st, msg))
+    if dry_run or not results:
+        return results
+    with store.txn(sid) as d:
+        if d is not None:
+            for rid, st, msg in results:
+                rr = d["resources"].get(rid)
+                if rr:
+                    rr["state"] = st
+                    rr["note"] = msg
+                    if st in ("closed", "refused", "released"):
+                        rr["closed_at"] = now()
+    return results
+
+
+# ----------------------------------------------------------------------------
+# Bash command analysis
+# ----------------------------------------------------------------------------
+WRAPPERS = {"nohup", "setsid", "exec", "time", "command", "env", "stdbuf", "nice", "caffeinate", "disown"}
+DETACH_WRAPPERS = {"nohup", "setsid", "disown"}
+NOT_SERVERS = {"cd", "echo", "export", "source", ".", "true", "false", "test", "[", "printf", "set", "unset", "alias",
+               "wait", "read", "kill", "pkill", "killall", "ls", "cat", "grep", "rg", "git", "mkdir", "rm", "cp", "mv",
+               "touch", "curl", "wget", "sed", "awk", "head", "tail", "pwd", "which", "chmod", "ps", "lsof"}
+DEV_PATTERNS = [re.compile(p) for p in (
+    r"\b(npm|pnpm|yarn|bun)\s+(run\s+)?(dev|start|serve|preview|watch|storybook)\b",
+    r"\bnpx\s+(--yes\s+|-y\s+)?(vite|next|nuxt|astro|serve|http-server|live-server|webpack|parcel|expo|storybook|ng)\b",
+    r"(^|/|\s)(vite|nuxt|astro|remix|webpack-dev-server|http-server|live-server|storybook)(\s|$)",
+    r"(^|/|\s)next\s+(dev|start)\b",
+    r"\b(webpack|ng|expo|hugo|jekyll|mkdocs|trunk)\s+(serve|start|server)\b",
+    r"\bpython[0-9.]*\s+-m\s+(http\.server|SimpleHTTPServer)\b",
+    r"\b(uvicorn|gunicorn|hypercorn|daphne)\b",
+    r"\bflask\s+(--app\s+\S+\s+)?run\b", r"\bfastapi\s+(dev|run)\b",
+    r"\bmanage\.py\s+runserver\b", r"\bdjango-admin\s+runserver\b",
+    r"\brails\s+(s|server)\b", r"\bphp\s+-S\b", r"\bbun\s+--hot\b", r"\bdeno\s+(task\s+)?(dev|start|serve)\b",
+)]
+
+
+def split_segments(cmd):
+    """Quote-aware split on && || ; | newline and a lone & . Returns [(text, terminator, bg)]."""
+    segs, buf = [], []
+    i, n, q = 0, len(cmd), None
+
+    def flush(term):
+        t = "".join(buf).strip()
+        del buf[:]
+        if t or term:
+            segs.append([t, term])
+
+    while i < n:
+        c = cmd[i]
+        if q:
+            buf.append(c)
+            if q == '"' and c == "\\" and i + 1 < n:
+                buf.append(cmd[i + 1])
+                i += 2
+                continue
+            if c == q:
+                q = None
+            i += 1
+            continue
+        if c in "'\"":
+            q = c
+            buf.append(c)
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            buf.append(c)
+            buf.append(cmd[i + 1])
+            i += 2
+            continue
+        if c == "#" and (not buf or buf[-1] in " \t"):
+            while i < n and cmd[i] != "\n":
+                i += 1
+            continue
+        two = cmd[i:i + 2]
+        if two in ("&&", "||"):
+            flush(two)
+            i += 2
+            continue
+        if c in ";\n|":
+            flush(c)
+            i += 1
+            continue
+        if c == "&":
+            prev = cmd[i - 1] if i > 0 else ""
+            nxt = cmd[i + 1] if i + 1 < n else ""
+            if prev in "<>" or nxt == ">":
+                buf.append(c)
+                i += 1
+                continue
+            flush("&")
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    flush("")
+    segs = [s for s in segs if s[0]]
+    out = []
+    carry = False
+    for text, term in reversed(segs):
+        bg = term == "&" or (term in ("|", "&&", "||") and carry)
+        carry = bg
+        out.append((text, term, bg))
+    out.reverse()
+    return out
+
+
+_REDIR_OP = re.compile(r"^\d*(>>?|<|&>>?|>&|<<<?)$")
+_REDIR_INLINE = re.compile(r"^\d*(>>?|<|&>>?|>&)\S")
+
+
+def seg_argv(text):
+    try:
+        toks = shlex.split(text, posix=True)
+    except ValueError:
+        toks = text.split()
+    cleaned, skip = [], False
+    for t in toks:
+        if skip:
+            skip = False
+            continue
+        if _REDIR_OP.match(t):
+            skip = True
+            continue
+        if _REDIR_INLINE.match(t):
+            continue
+        cleaned.append(t)
+    envs, wrapped = {}, False
+    while cleaned:
+        t = cleaned[0]
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", t)
+        if m:
+            envs[m.group(1)] = m.group(2)
+            cleaned.pop(0)
+            continue
+        if t in WRAPPERS:
+            wrapped = wrapped or t in DETACH_WRAPPERS
+            cleaned.pop(0)
+            continue
+        if t in ("(", "{", ")", "}", "!"):
+            cleaned.pop(0)
+            continue
+        break
+    return cleaned, envs, wrapped
+
+
+def declared_port(argv, envs, devlike):
+    s = " ".join(argv)
+    pats = [r"(?:--port|--listen|--http-port)[= ](\d{2,5})\b",
+            r"\bhttp\.server\s+(?:--bind\s+\S+\s+|-b\s+\S+\s+)?(\d{2,5})\b",
+            r"(?:\s-S|--bind|\s-b|--host|\s-l|--listen)[= ]\S*:(\d{2,5})\b",
+            r"\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{2,5})\b"]
+    if devlike:
+        pats.append(r"(?:^|\s)-p[= ]?(\d{2,5})\b")
+    for p in pats:
+        m = re.search(p, s)
+        if m:
+            return int(m.group(1))
+    v = envs.get("PORT", "")
+    if v.isdigit():
+        return int(v)
+    return None
+
+
+def analyze_bash(cmd, base_cwd, run_in_bg=False):
+    """Returns list of segment dicts for candidate long-running commands plus sim-boot info."""
+    cwd = base_cwd or os.getcwd()
+    out = []
+    for text, term, bg in split_segments(cmd or ""):
+        argv, envs, wrapped = seg_argv(text)
+        if not argv:
+            continue
+        if argv[0] == "cd" and len(argv) > 1:
+            tgt = os.path.expanduser(argv[1])
+            cwd = tgt if os.path.isabs(tgt) else os.path.normpath(os.path.join(cwd, tgt))
+            continue
+        joined = " ".join(argv)
+        devlike = any(p.search(joined) for p in DEV_PATTERNS)
+        first = os.path.basename(argv[0])
+        sim_boot, sim_target = False, None
+        if "simctl" in argv:
+            k = argv.index("simctl")
+            rest = argv[k + 1:]
+            if rest[:1] == ["boot"] or (rest[:1] == ["bootstatus"] and "-b" in rest):
+                sim_boot = True
+                tg = [a for a in rest[1:] if not a.startswith("-")]
+                sim_target = tg[0] if tg else None
+        cand = (bg or wrapped or devlike or run_in_bg) and first not in NOT_SERVERS and not sim_boot
+        out.append({"argv": argv, "norm": joined, "cwd": cwd, "bg": bg, "wrapped": wrapped, "devlike": devlike,
+                    "candidate": bool(cand), "port": declared_port(argv, envs, devlike) if cand else None,
+                    "sim_boot": sim_boot, "sim_target": sim_target})
+    return out
+
+
+def ports_in_text(text):
+    ports = set()
+    for m in re.finditer(r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\]|::1):(\d{2,5})\b", text):
+        ports.add(int(m.group(1)))
+    for m in re.finditer(r"\bPORT=(\d{2,5})\b", text):
+        ports.add(int(m.group(1)))
+    return ports
+
+
+def seg_matches_proc(seg, p):
+    argv = seg["argv"]
+    first = os.path.basename(argv[0])
+    if not first or first in NOT_SERVERS:
+        return False
+    cl = p.cmdline
+    idx = cl.find(first)
+    if idx < 0:
+        return False
+    for t in argv[1:]:
+        j = cl.find(t, idx)
+        if j < 0:
+            return False
+        idx = j + len(t)
+    return True
+
+
+def registered_pids(store):
+    pids = set()
+    for sid in store.sessions():
+        d = store.read(sid)
+        if not d:
+            continue
+        for r in d["resources"].values():
+            if r["state"] in OPEN_STATES and r.get("pid"):
+                pids.add(int(r["pid"]))
+                for ch in r.get("children") or []:
+                    with contextlib.suppress(Exception):
+                        pids.add(int(ch["pid"]))
+    return pids
+
+
+def find_new_processes(store, segs, since, owner_pid, hook_cwd, table, exclude=()):
+    prot = protect_set()
+    exclude = set(exclude)
+    reg = registered_pids(store)
+    matched = {}
+    real_cwd = os.path.realpath(hook_cwd) if hook_cwd else None
+    for p in table.values():
+        if p.epoch < since - 2.0 or p.pid in prot or p.pid in reg or p.state in ("Z", "X") or looks_like_agent(p) \
+                or (p.pid, p.start) in exclude:
+            continue
+        for s in segs:
+            if not s["candidate"] or not seg_matches_proc(s, p):
+                continue
+            ok = False
+            if owner_pid and owner_pid in ancestors(p.pid, table):
+                ok = True
+            else:
+                c = proc_cwd(p.pid)
+                if c:
+                    rc = os.path.realpath(c)
+                    for base in {real_cwd, os.path.realpath(s["cwd"])}:
+                        if base and (rc == base or rc.startswith(base + "/")):
+                            ok = True
+            if ok:
+                matched[p.pid] = (p, s)
+                break
+    roots = [pp for pid, (pp, s) in matched.items() if pp.ppid not in matched]
+    return [(p, matched[p.pid][1]) for p in roots]
+
+
+# ----------------------------------------------------------------------------
+# Browser MCP parsing
+# ----------------------------------------------------------------------------
+def flatten_response(x):
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x
+    if isinstance(x, list):
+        return "\n".join(flatten_response(i) for i in x)
+    if isinstance(x, dict):
+        if isinstance(x.get("content"), (list, str)):
+            return flatten_response(x["content"])
+        if "text" in x and isinstance(x["text"], str):
+            return x["text"]
+        try:
+            return json.dumps(x)
+        except Exception:
+            return str(x)
+    return str(x)
+
+
+_TAB_LINE = re.compile(r"^\s*(?:[-*]\s*)?(\d+):\s*(.*)$")
+_URL_IN = re.compile(r"((?:https?|file|about|chrome|data):[^\s)\]>]*)")
+
+
+def parse_tabs(text):
+    """Parse '### Open tabs' (Playwright) / '## Pages' (chrome-devtools) lists. None if no list is found."""
+    lines = text.splitlines()
+    start = None
+    for i, ln in enumerate(lines):
+        if re.match(r"^\s*#{1,4}\s*(Open tabs|Pages)\b", ln, re.I):
+            start = i + 1
+            break
+    if start is None:
+        return None
+    tabs = []
+    for ln in lines[start:]:
+        if re.match(r"^\s*#{1,4}\s", ln):
+            break
+        m = _TAB_LINE.match(ln)
+        if not m:
+            if ln.strip() == "" and tabs:
+                break
+            continue
+        rest = m.group(2)
+        cur = "(current)" in rest or "[selected]" in rest
+        rest2 = rest.replace("(current)", "").replace("[selected]", "").replace("[crashed]", "").strip()
+        urls = _URL_IN.findall(rest2)
+        tabs.append({"ref": int(m.group(1)), "url": urls[-1] if urls else None, "title": rest2, "current": cur})
+    return tabs if tabs else None
+
+
+def parse_page_url(text):
+    m = re.search(r"^\s*-\s*Page URL:\s*(\S+)", text, re.M)
+    return m.group(1) if m else None
+
+
+def norm_url(u):
+    if not u:
+        return None
+    try:
+        s = urlsplit(u.strip())
+    except Exception:
+        return u
+    host = (s.hostname or "").lower()
+    if host in ("127.0.0.1", "0.0.0.0", "::1", "localhost"):
+        host = "localhost"
+    port = ":%d" % s.port if s.port else ""
+    path = s.path.rstrip("/")
+    return "%s://%s%s%s%s" % (s.scheme.lower(), host, port, path, ("?" + s.query) if s.query else "")
+
+
+def browser_family(tool):
+    m = re.match(r"^mcp__(.+?)__(.+)$", tool or "")
+    if not m:
+        return None
+    server, name = m.group(1), m.group(2)
+    sl = server.lower()
+    if "playwright" in sl:
+        fam = "playwright"
+    elif re.search(r"chrome[-_]?devtools", sl):
+        fam = "devtools"
+    elif re.search(r"claude[-_]?in[-_]?chrome", sl):
+        fam = "chrome-ext"
+    else:
+        return None
+    return fam, name, "mcp__%s__" % server
+
+
+def browser_action(fam, name, ti):
+    if fam == "playwright":
+        if name == "browser_navigate":
+            return "navigate"
+        if name == "browser_tabs":
+            a = (ti.get("action") or "list").lower()
+            return {"new": "new", "create": "new", "close": "close", "select": "select", "list": "list"}.get(a, "other")
+        if name == "browser_tab_new":
+            return "new"
+        if name == "browser_tab_close":
+            return "close"
+        if name == "browser_tab_select":
+            return "select"
+        if name == "browser_tab_list":
+            return "list"
+        if name == "browser_close":
+            return "close_browser"
+        return "other"
+    if fam == "devtools":
+        return {"new_page": "new", "close_page": "close", "select_page": "select", "list_pages": "list",
+                "navigate_page": "navigate"}.get(name, "other")
+    return {"tabs_create_mcp": "new", "navigate": "navigate", "tabs_context_mcp": "list"}.get(name, "other")
+
+
+REF_KIND = {"playwright": "index", "devtools": "pageId", "chrome-ext": "tabId"}
+BROWSER_PROC = re.compile(r"ms-playwright|playwright_chromiumdev_profile|playwright_firefox|chrome-devtools-mcp|puppeteer_dev_chrome_profile")
+
+
+def tab_ref_from_input(ti):
+    for k in ("pageId", "pageIdx", "index", "tabId", "tab_id"):
+        v = ti.get(k)
+        if isinstance(v, int) or (isinstance(v, str) and v.isdigit()):
+            return int(v)
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Hooks
+# ----------------------------------------------------------------------------
+def read_stdin_json():
+    try:
+        raw = sys.stdin.read()
+        return json.loads(raw) if raw.strip() else {}
+    except Exception:
+        return {}
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj))
+    sys.stdout.flush()
+
+
+def norm_tool(hi, agent):
+    tool = hi.get("tool_name") or ""
+    ti = hi.get("tool_input") or {}
+    if agent == "gemini":
+        if tool == "run_shell_command":
+            tool = "Bash"
+        elif tool == "write_file":
+            tool = "Write"
+        elif tool.startswith("mcp_"):
+            tool = "mcp__" + tool[4:].replace("_", "__", 1)
+    return tool, ti if isinstance(ti, dict) else {}
+
+
+def ensure_session(store, hi, agent):
+    sid = hi.get("session_id") or env("SESSION_ID") or "unknown"
+    op, ost = find_owner()
+    with store.txn(sid, create=dict(owner_pid=op, owner_start=ost, cwd=hi.get("cwd"), agent=agent)) as d:
+        if d is not None and d.get("ended"):
+            d["ended"] = False
+    return sid
+
+
+def touch(d, text, tool_prefix=None):
+    """Mark resources referenced by this tool call as used. Returns number touched."""
+    n, t = 0, now()
+    ports = ports_in_text(text)
+    for r in open_resources(d):
+        hit = False
+        if r["type"] == "process":
+            rp = set(r.get("ports") or []) | ({r["port"]} if r.get("port") else set())
+            hit = bool(ports & rp)
+        elif r["type"] == "browser_tab":
+            u = r.get("url") or ""
+            hit = bool(u) and u in text
+            if not hit and tool_prefix and r.get("tool_prefix") == tool_prefix:
+                cur = (d["browsers"].get(tool_prefix) or {}).get("current_ref")
+                hit = cur is not None and cur == r.get("tab_ref")
+        elif r["type"] == "simulator":
+            hit = (r.get("udid") and r["udid"] in text) or "simctl" in text or "xcodebuild" in text
+        elif r["type"] == "temp_file":
+            hit = bool(r.get("path")) and r["path"] in text
+        if hit:
+            r["last_used_at"] = t
+            n += 1
+    return n
+
+
+def deny_out(reason, agent):
+    if agent == "gemini":
+        emit({"decision": "deny", "reason": reason})
+    else:
+        emit({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                     "permissionDecisionReason": reason}})
+
+
+def context_out(event, text, agent):
+    if agent == "gemini":
+        name = {"PreToolUse": "BeforeTool", "PostToolUse": "AfterTool"}.get(event, event)
+        emit({"hookSpecificOutput": {"hookEventName": name, "additionalContext": text}})
+    else:
+        emit({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}})
+
+
+def cli_hint():
+    on_path = shutil.which(CLI_NAME)
+    return CLI_NAME if on_path and os.path.realpath(on_path) == os.path.realpath(SCRIPT_PATH) else 'python3 "%s"' % SCRIPT_PATH
+
+
+def find_dup_process(store, sid, seg):
+    for s_id in store.sessions():
+        dd = store.read(s_id)
+        if not dd:
+            continue
+        for r in open_resources(dd, "process"):
+            own = s_id == sid
+            ports = set(r.get("ports") or []) | ({r["port"]} if r.get("port") else set())
+            by_port = bool(seg["port"] and seg["port"] in ports)
+            by_cmd = own and seg["norm"] == r.get("command_norm") and \
+                os.path.realpath(seg["cwd"] or "") == os.path.realpath(r.get("cwd") or "?")
+            if (by_port or by_cmd) and proc_alive(r):
+                return s_id, r, ("port" if by_port else "command")
+    return None
+
+
+def sim_reuse_reason(booted, owned_udids):
+    lines = []
+    for b in booted:
+        lines.append("  - %s  \"%s\" (%s)%s" % (b["udid"], b["name"], b["runtime"],
+                                              "  [opened by this session]" if b["udid"] in owned_udids else "  [not opened by this agent]"))
+    return ("%s: an iOS simulator is already booted - reuse it instead of booting another:\n%s\n"
+            "Use `xcrun simctl install/launch <that UDID> ...` or `-destination 'id=<UDID>'`. "
+            "If you really need a different device add `# %s` to the command." % (DISPLAY_NAME, "\n".join(lines), FORCE_MARKER))
+
+
+def hook_pre(hi, agent):
+    tool, ti = norm_tool(hi, agent)
+    sid = hi.get("session_id") or env("SESSION_ID") or "unknown"
+    store = Store()
+    text = json.dumps(ti)
+    force = FORCE_MARKER in text
+    pending, notes, deny = {}, [], None
+    d0 = store.read(sid) or new_session(sid)
+    bf = browser_family(tool)
+    if tool == "Bash":
+        segs = analyze_bash(ti.get("command", ""), hi.get("cwd"), bool(ti.get("run_in_background")))
+        sim = [s for s in segs if s["sim_boot"]]
+        cands = [s for s in segs if s["candidate"]]
+        if sim:
+            booted = sim_booted()
+            if booted is not None:
+                pending["sim_pre"] = [b["udid"] for b in booted]
+                tgt = sim[0]["sim_target"]
+                if booted and not (tgt and tgt in pending["sim_pre"]) and not force:
+                    owned = {r["udid"] for r in open_resources(d0, "simulator") if r.get("owned")}
+                    deny = sim_reuse_reason(booted, owned)
+                pending["sim_boot"] = True
+        if cands:
+            pending["pre_ts"] = now()
+            # processes that already match the command BEFORE it runs are never claimed (user's / earlier ones)
+            pending["pre_match"] = [[p.pid, p.start] for p in list_processes().values()
+                                    if any(seg_matches_proc(sg, p) for sg in cands)]
+            for s in cands:
+                dup = find_dup_process(store, sid, s)
+                if dup and not force and not deny:
+                    s_id, r, why = dup
+                    mine = s_id == sid
+                    pr = r.get("ports") or ([r["port"]] if r.get("port") else [])
+                    deny = ("%s: %s already running%s (id %s, pid %s%s, cwd %s, opened %s ago). Reuse it%s instead of starting "
+                            "another. To restart it: `%s close %s` then run the command again; to override add `# %s`."
+                            % (DISPLAY_NAME, "this exact server is" if why == "command" else "a server on port %s is" % s["port"],
+                               "" if mine else " in another agent session (%s)" % s_id, r["id"], r["pid"],
+                               (", port %s" % ",".join(str(p) for p in pr)) if pr else "", r.get("cwd"), ago(r["opened_at"]),
+                               (" at http://localhost:%s" % pr[0]) if pr else "", cli_hint(), r["id"], FORCE_MARKER))
+                elif not dup and s["port"] and IS_LINUX:
+                    pl = port_listener(s["port"])
+                    if pl:
+                        notes.append("port %s is already in use by pid %s (%s) which is NOT owned by %s; it will not be touched. "
+                                     "Pick another port or reuse it." % (s["port"], pl[0], pl[1][:60], DISPLAY_NAME))
+    elif tool in ("Write",) and ti.get("file_path"):
+        pending["existed"] = os.path.lexists(ti["file_path"])
+    elif bf:
+        fam, name, prefix = bf
+        act = browser_action(fam, name, ti)
+        if act == "new" and not force:
+            want = norm_url(ti.get("url"))
+            if want:
+                for r in open_resources(d0, "browser_tab"):
+                    if r.get("tool_prefix") == prefix and r["state"] == "open" and norm_url(r.get("url")) == want:
+                        deny = ("%s: %s is already open in a tab opened by this session (%s=%s, id %s). Reuse it: select that tab"
+                                " and navigate/reload instead of opening a new one. Override: put `%s` in the URL fragment."
+                                % (DISPLAY_NAME, r["url"], r.get("tab_ref_kind"), r.get("tab_ref"), r["id"], FORCE_MARKER))
+                        break
+    elif tool.startswith("mcp__") and re.search(r"(^|__)boot_sim(ulator)?$", tool):
+        booted = sim_booted()
+        if booted is not None:
+            pending["sim_pre"] = [b["udid"] for b in booted]
+            pending["sim_boot"] = True
+            tgt = ti.get("simulatorId") or ti.get("simulatorUuid") or ti.get("udid")
+            if booted and not (tgt and tgt in pending["sim_pre"]) and not force:
+                owned = {r["udid"] for r in open_resources(d0, "simulator") if r.get("owned")}
+                deny = sim_reuse_reason(booted, owned)
+    if deny:
+        deny_out(deny, agent)
+        log("deny %s: %s" % (tool, deny[:160]))
+        return
+    key = hi.get("tool_use_id") or hashlib.md5(text.encode()).hexdigest()
+    if pending or d0["resources"]:
+        op, ost = find_owner()
+        with store.txn(sid, create=dict(owner_pid=op, owner_start=ost, cwd=hi.get("cwd"), agent=agent)) as d:
+            touch(d, text, bf[2] if bf else None)
+            if pending:
+                d["pending"][key] = dict(pending, ts=now())
+            for k in [k for k, v in d["pending"].items() if now() - v.get("ts", 0) > 900]:
+                d["pending"].pop(k, None)
+    if notes:
+        context_out("PreToolUse", "%s: %s" % (DISPLAY_NAME, " ".join(notes)), agent)
+
+
+def register_process_tree(d, p, seg, table, cfg, ports_map):
+    desc = descendants(p.pid, table)
+    r = add_resource(d, "process", pid=p.pid, pid_start=p.start, command=(seg.get("command_text") or p.cmdline)[:400],
+                     command_norm=seg["norm"], cwd=os.path.realpath(seg["cwd"]) if seg.get("cwd") else None)
+    r["children"] = [{"pid": c, "start": table[c].start} for c in desc[:60] if c in table]
+    ports = []
+    for pid in [p.pid] + desc:
+        for pt in ports_map.get(pid, []):
+            if pt not in ports:
+                ports.append(pt)
+    r["ports"] = ports
+    r["port"] = seg["port"] if seg["port"] in ports else (ports[0] if ports else seg["port"])
+    return r
+
+
+def hook_post(hi, agent):
+    tool, ti = norm_tool(hi, agent)
+    sid = hi.get("session_id") or env("SESSION_ID") or "unknown"
+    store = Store()
+    cfg = load_config()
+    text = json.dumps(ti)
+    resp = hi.get("tool_response")
+    msgs = []
+    bf = browser_family(tool)
+    snap = store.read(sid)
+    pend = {}
+    key = hi.get("tool_use_id") or hashlib.md5(text.encode()).hexdigest()
+    if snap:
+        pend = dict(snap.get("pending", {}).get(key, {}))
+    op, ost = find_owner()
+    create = dict(owner_pid=op, owner_start=ost, cwd=hi.get("cwd"), agent=agent)
+    new_procs, new_sims, new_files = [], [], []
+
+    # ---- heavy detection outside the lock ------------------------------------------
+    if tool == "Bash":
+        segs = analyze_bash(ti.get("command", ""), hi.get("cwd"), bool(ti.get("run_in_background")))
+        cands = [s for s in segs if s["candidate"]]
+        for s in cands:
+            s["command_text"] = s["norm"]
+        owner_pid = (snap or {}).get("owner_pid") or op
+        if cands:
+            since = pend.get("pre_ts") or (now() - 15)
+            deadline = time.time() + 1.2
+            found = []
+            while True:
+                found = find_new_processes(store, cands, since, owner_pid, hi.get("cwd"), list_processes(),
+                                           exclude=[(a, b) for a, b in pend.get("pre_match", [])])
+                if found or time.time() > deadline:
+                    break
+                time.sleep(0.15)
+            if found:
+                want_ports = [s["port"] for _, s in found if s["port"]]
+                t_end = time.time() + (cfg["port_wait_seconds"] if want_ports else 0.4)
+                while True:
+                    table = list_processes()
+                    pm = listening_ports([x for p, _ in found for x in [p.pid] + descendants(p.pid, table)])
+                    have = {pt for v in pm.values() for pt in v}
+                    if (want_ports and all(w in have for w in want_ports)) or (not want_ports and have) or time.time() > t_end:
+                        break
+                    time.sleep(0.15)
+                table = list_processes()
+                for p, s in found:
+                    cur = table.get(p.pid)
+                    if cur and cur.start == p.start:
+                        new_procs.append((cur, s, table, pm))
+        sim = [s for s in segs if s["sim_boot"]]
+        if pend.get("sim_boot") and sim:
+            booted = sim_booted() or []
+            pre = set(pend.get("sim_pre") or [])
+            new = [b for b in booted if b["udid"] not in pre]
+            tgt = sim[0]["sim_target"]
+            if tgt and UDID_RE.match(tgt):
+                new = [b for b in new if b["udid"] == tgt]
+            elif tgt and tgt != "booted":
+                new = [b for b in new if b["name"] == tgt]
+            elif len(new) != 1:
+                new = []  # ambiguous: fail closed (do not claim)
+            new_sims = new
+    elif tool.startswith("mcp__") and re.search(r"(^|__)boot_sim(ulator)?$", tool) and pend.get("sim_boot"):
+        booted = sim_booted() or []
+        pre = set(pend.get("sim_pre") or [])
+        new = [b for b in booted if b["udid"] not in pre]
+        tgt = ti.get("simulatorId") or ti.get("simulatorUuid") or ti.get("udid")
+        if tgt:
+            new = [b for b in new if b["udid"] == tgt]
+        elif len(new) != 1:
+            new = []
+        new_sims = new
+    elif tool == "Write" and ti.get("file_path"):
+        path = ti["file_path"]
+        rtype = (resp or {}).get("type") if isinstance(resp, dict) else None
+        existed = pend.get("existed")
+        created = (rtype == "create") if rtype else (existed is False)
+        if existed is True:
+            created = False
+        if created and is_temp_path(store, path, hi.get("scratchpad_dir")) \
+                and not os.path.abspath(path).startswith(store.tmpdir_for(sid) + "/"):
+            new_files.append(path)
+    browser_proc = None
+    if bf and ((snap or {}).get("owner_pid") or op):
+        snapd = snap or new_session(sid)
+        if not any(r.get("tool_prefix") == bf[2] and r["state"] in OPEN_STATES for r in open_resources(snapd, "browser_process")):
+            table = list_processes()
+            owner_pid = snapd.get("owner_pid") or op
+            reg = registered_pids(store)
+            for p in table.values():
+                if p.pid in reg or "--type=" in p.cmdline or not BROWSER_PROC.search(p.cmdline):
+                    continue
+                if owner_pid in ancestors(p.pid, table):
+                    browser_proc = p
+                    break
+
+    # ---- state update under the lock -------------------------------------------------
+    with store.txn(sid, create=create) as d:
+        d["pending"].pop(key, None)
+        touch(d, text, bf[2] if bf else None)
+        for cur, s, table, pm in new_procs:
+            if any(r.get("pid") == cur.pid and r["state"] in OPEN_STATES for r in d["resources"].values()):
+                continue
+            r = register_process_tree(d, cur, s, table, cfg, pm)
+            msgs.append("registered %s (pid %s%s)" % (r["id"], r["pid"], ", port %s" % r["port"] if r["port"] else ""))
+        for b in new_sims:
+            if not any(r.get("udid") == b["udid"] and r["state"] in OPEN_STATES for r in d["resources"].values()):
+                r = add_resource(d, "simulator", udid=b["udid"], command=b["name"], owned=True)
+                msgs.append("registered %s (simulator %s \"%s\" booted by you)" % (r["id"], b["udid"], b["name"]))
+        for path in new_files:
+            if not any(r.get("path") == path and r["state"] in OPEN_STATES for r in d["resources"].values()):
+                r = add_resource(d, "temp_file", path=path)
+                msgs.append("registered temp file %s" % r["id"])
+        if bf and browser_proc is not None:
+            r = add_resource(d, "browser_process", pid=browser_proc.pid, pid_start=browser_proc.start,
+                             command=browser_proc.cmdline[:300], server=bf[0], tool_prefix=bf[2],
+                             cwd=hi.get("cwd"))
+            msgs.append("registered %s (browser pid %s)" % (r["id"], browser_proc.pid))
+        if bf:
+            msgs.extend(post_browser(d, bf, ti, flatten_response(resp), hi))
+        # lazily discover ports / children for servers that were not listening yet
+        for r in open_resources(d, "process"):
+            if not r.get("ports") and now() - r["opened_at"] < 600 and proc_alive(r):
+                tab = list_processes()
+                kids = descendants(r["pid"], tab)
+                pm = listening_ports([r["pid"]] + kids)
+                ports = sorted({pt for v in pm.values() for pt in v})
+                if ports:
+                    r["ports"] = ports
+                    r["port"] = r["port"] if r["port"] in ports else ports[0]
+                r["children"] = [{"pid": c, "start": tab[c].start} for c in kids[:60] if c in tab]
+    if msgs:
+        context_out("PostToolUse", "%s: %s. Reuse before opening duplicates; close what you opened when done (`%s close --all-mine`)."
+                    % (DISPLAY_NAME, "; ".join(msgs), cli_hint()), agent)
+
+
+def post_browser(d, bf, ti, text, hi):
+    fam, name, prefix = bf
+    act = browser_action(fam, name, ti)
+    msgs = []
+    b = d["browsers"].setdefault(prefix, {"current_ref": None})
+    tabs = parse_tabs(text)
+    kind = REF_KIND[fam]
+    mine = [r for r in d["resources"].values() if r["type"] == "browser_tab" and r.get("tool_prefix") == prefix
+            and r["state"] in OPEN_STATES]
+    cur = None
+    if tabs:
+        cur = next((t for t in tabs if t["current"]), None)
+        if cur:
+            b["current_ref"] = cur["ref"]
+    page_url = parse_page_url(text)
+
+    def register(ref, url):
+        r = add_resource(d, "browser_tab", server=fam, tool_prefix=prefix, tab_ref=ref, tab_ref_kind=kind, url=url)
+        msgs.append("registered %s (%s tab %s=%s %s)" % (r["id"], fam, kind, ref, url or ""))
+        return r
+
+    def by_ref(ref):
+        return next((r for r in mine if ref is not None and r.get("tab_ref") == ref), None)
+
+    if act == "new":
+        url = (cur or {}).get("url") or ti.get("url")
+        ref = (cur or {}).get("ref")
+        if ref is None:
+            m = re.search(r"(?i)(?:tab|page)\s*(?:id)?\D{0,4}(\d+)", text)
+            ref = int(m.group(1)) if m else None
+        register(ref, url)
+        b["current_ref"] = ref
+    elif act == "navigate":
+        url = ti.get("url")
+        tgt = by_ref(b["current_ref"]) if b.get("current_ref") is not None else None
+        if tgt is None and b.get("current_ref") is None and len(mine) == 1:
+            tgt = mine[0]  # single known tab and no explicit current tab: it is the one being navigated
+        if tgt:
+            tgt["url"] = url or tgt["url"]
+        elif not mine and (not tabs or len(tabs) <= 1) and url and any(
+                x["type"] == "browser_process" and x.get("tool_prefix") == prefix and x["state"] in OPEN_STATES
+                for x in d["resources"].values()):
+            # implicit first tab: claimed only when this session's own browser process was detected, so attach /
+            # extension modes (where the "current tab" belongs to the user) are never claimed
+            ref = (cur or {}).get("ref")
+            ref = 0 if ref is None and fam == "devtools" and False else ref
+            register(ref, url)
+            if ref is not None:
+                b["current_ref"] = ref
+        elif not mine:
+            b["untracked_note"] = "navigate with pre-existing tabs: not claimed"
+    elif act == "select":
+        ref = tab_ref_from_input(ti)
+        if ref is not None:
+            b["current_ref"] = ref
+    elif act == "close":
+        ref = tab_ref_from_input(ti)
+        if ref is None:
+            ref = b.get("current_ref")
+        tgt = by_ref(ref)
+        if tgt:
+            tgt["state"] = "closed"
+            tgt["closed_at"] = now()
+            tgt["note"] = "closed via browser tool"
+        if kind == "index" and ref is not None:
+            for r in mine:
+                if r["state"] in OPEN_STATES and r.get("tab_ref") is not None and r["tab_ref"] > ref:
+                    r["tab_ref"] -= 1
+    elif act == "close_browser":
+        for r in mine:
+            r["state"] = "closed"
+            r["closed_at"] = now()
+            r["note"] = "browser closed"
+        b["current_ref"] = None
+    if tabs and any(t["url"] for t in tabs):
+        # re-sync refs/liveness of registered tabs with the listed tabs
+        listed = {}
+        for t in tabs:
+            if t["url"]:
+                listed.setdefault(norm_url(t["url"]), []).append(t["ref"])
+        refs_all = {t["ref"]: t for t in tabs}
+        for r in [x for x in d["resources"].values() if x["type"] == "browser_tab" and x.get("tool_prefix") == prefix
+                  and x["state"] in OPEN_STATES]:
+            same = listed.get(norm_url(r.get("url")))
+            ent = refs_all.get(r.get("tab_ref"))
+            if ent is not None and (ent["url"] is None or norm_url(ent["url"]) == norm_url(r.get("url"))):
+                continue
+            if same:
+                r["tab_ref"] = same[0]
+            elif ent is not None:
+                r["url"] = ent["url"] or r.get("url")
+            elif act in ("list", "close", "new"):
+                r["state"] = "closed"
+                r["note"] = "no longer in the tab list"
+    elif page_url and b.get("current_ref") is not None:
+        tgt = by_ref(b["current_ref"])
+        if tgt:
+            tgt["url"] = page_url
+    return msgs
+
+
+def spawn_cleaner(sid, ids=None, protect=(), final=False, reason=""):
+    args = [sys.executable, SCRIPT_PATH, "_clean", "--session", sid, "--protect", ",".join(str(p) for p in protect)]
+    if ids:
+        args += ["--ids", ",".join(ids)]
+    if final:
+        args.append("--final")
+    if reason:
+        args += ["--reason", reason]
+    return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            close_fds=True, start_new_session=True)
+
+
+def hook_stop(hi, agent):
+    sid = hi.get("session_id") or env("SESSION_ID") or "unknown"
+    store = Store()
+    d = store.read(sid)
+    if not d:
+        return
+    cfg = load_config()
+    ttl = float(cfg["idle_ttl_minutes"]) * 60.0
+    expired, nudge = [], []
+    t = now()
+    if ttl > 0:
+        for r in open_resources(d):
+            if r["state"] == "open" and not r.get("keep_alive") and r["type"] in ("process", "browser_process", "simulator", "browser_tab") \
+                    and t - r["last_used_at"] >= ttl:
+                expired.append(r)
+    pend_tabs = [r for r in open_resources(d, "browser_tab") if r["state"] == "pending_close" and not r.get("nudged")]
+    if not expired and not pend_tabs:
+        return
+    kill_ids = [r["id"] for r in expired if r["type"] != "browser_tab"]
+    with store.txn(sid) as dd:
+        if dd is None:
+            return
+        for r in expired:
+            if r["type"] == "browser_tab" and r["id"] in dd["resources"]:
+                dd["resources"][r["id"]]["state"] = "pending_close"
+                dd["resources"][r["id"]]["note"] = "idle > %d min" % (ttl / 60)
+        pend_tabs = [r for r in open_resources(dd, "browser_tab") if r["state"] == "pending_close" and not r.get("nudged")]
+        if cfg["stop_nudge"] and not hi.get("stop_hook_active"):
+            for r in pend_tabs:
+                r["nudged"] = True
+                nudge.append(r)
+    if kill_ids:
+        op = d.get("owner_pid")
+        spawn_cleaner(sid, ids=kill_ids, protect=protect_set([op] if op else []), reason="idle-ttl")
+        log("stop: idle sweep %s" % kill_ids)
+    if nudge:
+        lines = ["- %s: %s" % (r["id"], tab_close_instructions(r)) for r in nudge]
+        context_out("Stop", "%s: these browser tabs were opened by this session and are idle/finished. Close them now with the "
+                    "browser tool (hooks cannot close MCP tabs themselves), then stop:\n%s" % (DISPLAY_NAME, "\n".join(lines)), agent)
+
+
+def summarize_open(d, limit=12):
+    rs = open_resources(d)
+    if not rs:
+        return "none"
+    out = [describe(r) for r in rs[:limit]]
+    if len(rs) > limit:
+        out.append("... and %d more" % (len(rs) - limit))
+    return "\n".join("  " + x for x in out)
+
+
+def owner_dead(d):
+    op = d.get("owner_pid")
+    if not op:
+        return None
+    return start_token(op) != d.get("owner_start")
+
+
+def hook_session_start(hi, agent):
+    sid = hi.get("session_id") or env("SESSION_ID") or "unknown"
+    store = Store()
+    cfg = load_config()
+    op, ost = find_owner()
+    recovered = []
+    leftover_same = []
+    with store.txn(sid, create=dict(owner_pid=op, owner_start=ost, cwd=hi.get("cwd"), agent=agent)) as d:
+        if d.get("owner_pid") and op and (d["owner_pid"] != op or d.get("owner_start") != ost) and owner_dead(d):
+            leftover_same = [r["id"] for r in open_resources(d) if r["type"] != "temp_dir"]
+        d["owner_pid"], d["owner_start"], d["ended"] = op, ost, False
+        d["cwd"] = hi.get("cwd") or d.get("cwd")
+    prot = protect_set([op] if op else [])
+    if leftover_same:
+        spawn_cleaner(sid, ids=leftover_same, protect=prot, reason="resume-recovery")
+        recovered.append("%s (previous run of this session): %d" % (sid, len(leftover_same)))
+    for other in store.sessions():
+        if other == safe_sid(sid):
+            continue
+        od = store.read(other)
+        if not od:
+            continue
+        opens = open_resources(od)
+        dead = owner_dead(od)
+        if dead is None:
+            dead = now() - od.get("updated_at", 0) > cfg["orphan_hours"] * 3600
+        if opens and dead:
+            spawn_cleaner(od["session_id"], protect=prot, final=True, reason="crash-recovery")
+            recovered.append("%s: %d" % (other, len(opens)))
+        elif not opens and (od.get("ended") or dead) and now() - od.get("updated_at", 0) > cfg["prune_days"] * 86400:
+            store.delete(other)
+            shutil.rmtree(store.tmpdir_for(other), ignore_errors=True)
+    tmp = ensure_tmpdir(store, sid)
+    envf = os.environ.get("CLAUDE_ENV_FILE")
+    if envf:
+        with contextlib.suppress(Exception):
+            with open(envf, "a") as f:
+                f.write("export %s_SESSION_ID=%s\n" % (ENV_PREFIX, shlex.quote(sid)))
+                f.write("export %s_TMPDIR=%s\n" % (ENV_PREFIX, shlex.quote(tmp)))
+    d = store.read(sid) or {}
+    ctx = ("%s is active (resource hygiene). Facts for this session:\n"
+           "- Everything you open (background processes/dev servers, browser tabs via Playwright/Chrome DevTools MCP, iOS "
+           "simulators you boot, temp files you write) is recorded in a per-session registry. Only things this session "
+           "opened are ever closed; user-started things are never touched.\n"
+           "- Before starting a server/tab/simulator, check `%s list` and reuse what is already open. Duplicate starts are "
+           "denied with the id/port/tab/UDID to reuse (override: `# %s`).\n"
+           "- Keep resources alive while later steps need them (`%s keep <id>`). Idle ones are closed after %s min.\n"
+           "- When the task is finished run `%s close --all-mine` and follow its instructions for browser tabs.\n"
+           "- Session temp dir: %s (deleted at session end).\n"
+           "Open resources owned by this session:\n%s"
+           % (DISPLAY_NAME, cli_hint(), FORCE_MARKER, cli_hint(), int(cfg["idle_ttl_minutes"]), cli_hint(), tmp,
+              summarize_open(d) if d else "none"))
+    if recovered:
+        ctx += "\nCrash recovery: closing leftovers of dead sessions -> %s" % "; ".join(recovered)
+    context_out("SessionStart", ctx, agent)
+
+
+def ensure_tmpdir(store, sid):
+    p = store.tmpdir_for(sid)
+    os.makedirs(p, mode=0o700, exist_ok=True)
+    with store.txn(sid, create=dict()) as d:
+        if not any(r["type"] == "temp_dir" and r["state"] in OPEN_STATES for r in d["resources"].values()):
+            add_resource(d, "temp_dir", path=p)
+    return p
+
+
+def hook_session_end(hi, agent):
+    sid = hi.get("session_id") or env("SESSION_ID") or "unknown"
+    store = Store()
+    d = store.read(sid)
+    if not d:
+        return
+    with store.txn(sid) as dd:
+        if dd is not None:
+            dd["ended"] = True
+            dd["ended_at"] = now()
+            dd["end_reason"] = hi.get("reason")
+            for r in open_resources(dd, "browser_tab"):
+                r["note"] = "session ended; tab could not be closed by a hook (closed only if its browser process is registered)"
+    if not open_resources(d):
+        return
+    op = d.get("owner_pid")
+    proc = spawn_cleaner(sid, protect=protect_set([op] if op else []), final=True, reason="session-end")
+    wait = load_config()["session_end_wait_ms"] / 1000.0
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=wait)
+
+
+def cmd_clean(a):
+    """Internal detached cleaner."""
+    store = Store()
+    ids = [x for x in (a.ids or "").split(",") if x] or None
+    res = close_resources(store, a.session, ids=ids, protect=parse_protect(a.protect))
+    for rid, st, msg in res:
+        log("clean[%s/%s] %s -> %s: %s" % (a.reason, a.session, rid, st, msg))
+    if a.final:
+        with store.txn(a.session) as d:
+            if d is not None:
+                for r in open_resources(d, "browser_tab"):
+                    # Hooks cannot close MCP tabs and the session is gone: record it and stop tracking.
+                    r["state"] = "orphaned"
+                d["ended"] = True
+    return 0
+
+
+HOOKS = {"pre-tool-use": hook_pre, "post-tool-use": hook_post, "stop": hook_stop, "session-start": hook_session_start,
+         "session-end": hook_session_end}
+
+
+def cmd_hook(a):
+    hi = read_stdin_json()
+    fn = HOOKS.get(a.event)
+    if not fn:
+        return 0
+    try:
+        fn(hi, a.agent)
+    except Exception as e:  # hooks must never break the agent: fail open, log
+        import traceback
+        log("hook %s error: %s\n%s" % (a.event, e, traceback.format_exc()))
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------------
+def resolve_session(store, explicit=None, required=True):
+    if explicit:
+        return explicit
+    v = env("SESSION_ID")
+    if v:
+        return v
+    anc = set(ancestors(os.getpid()))
+    live = []
+    for sid in store.sessions():
+        d = store.read(sid)
+        if not d:
+            continue
+        op = d.get("owner_pid")
+        if op and op in anc and start_token(op) == d.get("owner_start"):
+            return d["session_id"]
+        if op and not d.get("ended") and start_token(op) == d.get("owner_start"):
+            live.append(d)
+    here = [d for d in live if os.path.realpath(d.get("cwd") or "?") == os.path.realpath(os.getcwd())]
+    if len(here) == 1:
+        return here[0]["session_id"]
+    if required:
+        sys.stderr.write("%s: cannot tell which agent session this is. Pass --session <id> (see `%s list --all`).\n"
+                         % (CLI_NAME, CLI_NAME))
+        sys.exit(2)
+    return None
+
+
+def cmd_list(a):
+    store = Store()
+    sids = store.sessions() if a.all else [resolve_session(store, a.session, required=False)]
+    sids = [s for s in sids if s]
+    if not sids:
+        sids = store.sessions()
+    out = []
+    for sid in sids:
+        d = store.read(sid)
+        if not d:
+            continue
+        rs = list(d["resources"].values()) if a.history else open_resources(d)
+        for r in rs:
+            if r["type"] in ("process", "browser_process") and r["state"] == "open" and not proc_alive(r):
+                r = dict(r, state="dead?")
+        out.append((d, rs))
+    if a.json:
+        print(json.dumps([{"session_id": d["session_id"], "owner_pid": d.get("owner_pid"), "ended": d.get("ended"),
+                           "resources": rs} for d, rs in out], indent=1))
+        return 0
+    if not out:
+        print("no sessions registered")
+    for d, rs in out:
+        alive = owner_dead(d)
+        print("session %s  owner pid %s (%s)%s  cwd %s" % (d["session_id"], d.get("owner_pid"),
+                                                       "unknown" if alive is None else ("dead" if alive else "alive"),
+                                                       "  [ended]" if d.get("ended") else "", d.get("cwd")))
+        if not rs:
+            print("  (nothing open)")
+        for r in rs:
+            line = "  " + describe(r)
+            if r["type"] in ("process", "browser_process") and r["state"] == "open" and not proc_alive(r):
+                line += "  <- process no longer running"
+            print(line)
+            if r["type"] == "browser_tab" and r["state"] == "pending_close":
+                print("      close it: " + tab_close_instructions(r))
+    return 0
+
+
+def cmd_status(a):
+    store = Store()
+    cfg = load_config()
+    sid = resolve_session(store, a.session, required=False)
+    print("%s %s  state dir %s" % (DISPLAY_NAME, VERSION, store.root))
+    print("config: idle ttl %s min, grace %ss, stop nudge %s" % (cfg["idle_ttl_minutes"], cfg["grace_seconds"], cfg["stop_nudge"]))
+    print("current session: %s" % (sid or "unknown (not running inside an agent session?)"))
+    tot = {}
+    for s in store.sessions():
+        d = store.read(s)
+        if not d:
+            continue
+        for r in open_resources(d):
+            tot[r["type"]] = tot.get(r["type"], 0) + 1
+    print("sessions: %d  open resources: %s" % (len(store.sessions()), ", ".join("%s=%d" % kv for kv in sorted(tot.items())) or "0"))
+    if sid:
+        d = store.read(sid)
+        if d:
+            print("this session:\n" + summarize_open(d))
+    return 0
+
+
+def cmd_close(a):
+    store = Store()
+    if a.session and a.all_mine is False and not a.ids:
+        a.all_mine = True
+    sid = resolve_session(store, a.session)
+    d = store.read(sid)
+    if not d:
+        print("no registry for session %s" % sid)
+        return 1
+    ids = None
+    if a.ids:
+        ids = []
+        for i in a.ids:
+            r = resolve_id(d, i)
+            if not r:
+                print("unknown id %s" % i)
+                return 1
+            ids.append(r["id"])
+    elif not a.all_mine:
+        print("specify ids or --all-mine")
+        return 2
+    res = close_resources(store, sid, ids=ids, protect=parse_protect(a.protect), grace=a.grace, dry_run=a.dry_run,
+                          except_kept=a.except_kept)
+    if not res:
+        print("nothing open to close")
+    rc = 0
+    for rid, st, msg in res:
+        print("%-10s %-14s %s" % (rid, st, msg))
+        if st in ("refused",):
+            rc = 0
+    pend = [m for rid, st, m in res if st == "pending_close"]
+    if pend and not a.dry_run:
+        print("\nBrowser tabs cannot be closed from outside the browser MCP server. Call the tool for each line above that says "
+              "'agent must close it'; %s marks them closed automatically when the tool succeeds (or run `%s forget <id>`)."
+              % (DISPLAY_NAME, CLI_NAME))
+    return rc
+
+
+def _set_flag(a, val):
+    store = Store()
+    sid = resolve_session(store, a.session)
+    with store.txn(sid) as d:
+        if d is None:
+            print("no registry for session %s" % sid)
+            return 1
+        for i in a.ids:
+            r = resolve_id(d, i)
+            if not r:
+                print("unknown id %s" % i)
+                continue
+            r["keep_alive"] = val
+            r["last_used_at"] = now()
+            print("%s keep_alive=%s" % (r["id"], val))
+    return 0
+
+
+def cmd_keep(a):
+    return _set_flag(a, True)
+
+
+def cmd_release(a):
+    return _set_flag(a, False)
+
+
+def cmd_forget(a):
+    store = Store()
+    sid = resolve_session(store, a.session)
+    with store.txn(sid) as d:
+        if d is None:
+            return 1
+        for i in a.ids:
+            r = resolve_id(d, i)
+            if r:
+                r["state"] = "forgotten"
+                print("%s forgotten (not closed)" % r["id"])
+    return 0
+
+
+def cmd_sweep(a):
+    """Crash recovery for dead sessions + idle TTL for the current one."""
+    store = Store()
+    cfg = load_config()
+    me = resolve_session(store, a.session, required=False)
+    total = 0
+    for s in store.sessions():
+        d = store.read(s)
+        if not d or d["session_id"] == me:
+            continue
+        opens = open_resources(d)
+        dead = owner_dead(d)
+        if dead is None:
+            dead = now() - d.get("updated_at", 0) > cfg["orphan_hours"] * 3600
+        if opens and dead:
+            print("session %s: owner dead, closing %d leftovers" % (d["session_id"], len(opens)))
+            for rid, st, msg in close_resources(store, d["session_id"], dry_run=a.dry_run):
+                print("  %-10s %-14s %s" % (rid, st, msg))
+                total += 1
+            if not a.dry_run:
+                with store.txn(d["session_id"]) as dd:
+                    for r in open_resources(dd, "browser_tab"):
+                        r["state"] = "orphaned"
+                    dd["ended"] = True
+    if me and cfg["idle_ttl_minutes"] > 0:
+        for rid, st, msg in close_resources(store, me, dry_run=a.dry_run, only_idle_ttl=cfg["idle_ttl_minutes"] * 60):
+            print("idle %-10s %-14s %s" % (rid, st, msg))
+            total += 1
+    if not total:
+        print("nothing to sweep")
+    return 0
+
+
+def cmd_register(a):
+    store = Store()
+    sid = resolve_session(store, a.session)
+    op, ost = find_owner()
+    with store.txn(sid, create=dict(owner_pid=op, owner_start=ost, cwd=os.getcwd(), agent=a.agent or "manual")) as d:
+        t = a.type
+        if t == "process":
+            if not a.pid:
+                print("--pid required")
+                return 2
+            tok = start_token(a.pid)
+            if not tok:
+                print("pid %s is not running" % a.pid)
+                return 1
+            if a.pid in protect_set() or looks_like_agent(get_proc(a.pid)):
+                print("refusing to register a protected pid (agent or ancestor)")
+                return 1
+            tab = list_processes()
+            kids = descendants(a.pid, tab)
+            pm = listening_ports([a.pid] + kids)
+            ports = sorted({p for v in pm.values() for p in v})
+            r = add_resource(d, "process", pid=a.pid, pid_start=tok, command=a.command or tab[a.pid].cmdline[:400],
+                             command_norm=a.command, cwd=os.path.realpath(a.cwd or os.getcwd()), ports=ports,
+                             port=a.port or (ports[0] if ports else None))
+            r["children"] = [{"pid": c, "start": tab[c].start} for c in kids[:60] if c in tab]
+        elif t == "tab":
+            r = add_resource(d, "browser_tab", url=a.url, tab_ref=a.ref, server=a.server or "other",
+                             tab_ref_kind=REF_KIND.get(a.server or "", "id"), tool_prefix=a.tool_prefix)
+        elif t == "simulator":
+            if not UDID_RE.match(a.udid or ""):
+                print("--udid must be a simulator UDID")
+                return 2
+            r = add_resource(d, "simulator", udid=a.udid, owned=not a.not_owned)
+        elif t == "file":
+            p = os.path.abspath(a.path or "")
+            if not is_temp_path(store, p):
+                print("refusing: %s is not under a temp directory" % p)
+                return 1
+            r = add_resource(d, "temp_file", path=p)
+        else:
+            print("unknown type")
+            return 2
+        r["keep_alive"] = bool(a.keep)
+        print(r["id"])
+    return 0
+
+
+def cmd_tmpdir(a):
+    store = Store()
+    sid = resolve_session(store, a.session)
+    print(ensure_tmpdir(store, sid))
+    return 0
+
+
+def cmd_doctor(a):
+    store = Store()
+    ok = True
+
+    def line(status, msg):
+        print("[%s] %s" % (status, msg))
+
+    line("ok", "python %s on %s" % (sys.version.split()[0], sys.platform))
+    line("ok" if IS_LINUX or shutil.which("ps") else "FAIL", "process table via %s" % ("/proc" if IS_LINUX else "ps"))
+    if not IS_LINUX:
+        line("ok" if shutil.which("lsof") else "warn", "lsof (port + cwd discovery on macOS)")
+    try:
+        os.makedirs(store.sdir, exist_ok=True)
+        line("ok", "state dir writable: %s" % store.root)
+    except Exception as e:
+        ok = False
+        line("FAIL", "state dir: %s" % e)
+    t = start_token(os.getpid())
+    line("ok" if t else "FAIL", "start-time identity for own pid: %s" % t)
+    op, _ = find_owner()
+    line("ok" if op else "warn", "agent owner process: %s" % (op or "not found (not running under claude/codex/gemini?)"))
+    line("ok" if shutil.which("xcrun") else "info", "xcrun simctl: %s" % ("available" if shutil.which("xcrun") else "not available (simulator support inactive)"))
+    sp = os.path.expanduser("~/.claude/settings.json")
+    inst = False
+    with contextlib.suppress(Exception):
+        inst = SCRIPT_PATH in open(sp).read()
+    line("ok" if inst else "info", "manual hooks in %s: %s (plugin installs do not need this)" % (sp, "yes" if inst else "no"))
+    bad = 0
+    for s in store.sessions():
+        d = store.read(s)
+        if d is None:
+            bad += 1
+            continue
+        for r in open_resources(d):
+            if r["type"] in ("process", "browser_process") and not proc_alive(r):
+                line("info", "%s/%s: process gone or PID reused - will be marked closed on next close/sweep" % (s, r["id"]))
+    line("ok" if not bad else "warn", "registry files readable (%d unreadable)" % bad)
+    return 0 if ok else 1
+
+
+TOOL_MATCHER = "Bash|Write|mcp__.*(playwright|chrome|puppeteer|browser|boot_sim|simulator).*"
+HOOK_EVENTS = [("PreToolUse", "pre-tool-use", TOOL_MATCHER), ("PostToolUse", "post-tool-use", TOOL_MATCHER),
+               ("Stop", "stop", None), ("SessionStart", "session-start", None), ("SessionEnd", "session-end", None)]
+
+
+def hook_command(script, event):
+    return 'python3 "%s" hook %s' % (script, event)
+
+
+def _is_ours(h):
+    c = h.get("command", "") if isinstance(h, dict) else ""
+    return bool(re.search(r"/%s\"? hook " % re.escape(CLI_NAME), c))
+
+
+def cmd_install(a):
+    sp = os.path.expanduser(a.settings)
+    script = SCRIPT_PATH
+    if a.copy:
+        dst = os.path.join(state_dir(), "bin", CLI_NAME)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(SCRIPT_PATH, dst)
+        os.chmod(dst, 0o755)
+        script = dst
+    try:
+        with open(sp) as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        cfg = {}
+    hooks = cfg.setdefault("hooks", {})
+    for ev, name, matcher in HOOK_EVENTS:
+        groups = hooks.setdefault(ev, [])
+        for g in groups:
+            g["hooks"] = [h for h in g.get("hooks", []) if not _is_ours(h)]
+        groups[:] = [g for g in groups if g.get("hooks")]
+        h = {"type": "command", "command": hook_command(script, name)}
+        if ev == "SessionEnd":
+            h["timeout"] = 2
+        g = {"hooks": [h]}
+        if matcher:
+            g["matcher"] = matcher
+        groups.append(g)
+    if a.dry_run:
+        print(json.dumps(cfg, indent=2))
+        return 0
+    os.makedirs(os.path.dirname(sp), exist_ok=True)
+    if os.path.exists(sp):
+        shutil.copy2(sp, sp + ".%s-bak" % PLUGIN_NAME)
+    tmp = sp + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, sp)
+    print("installed %s hooks into %s (backup: %s.%s-bak)" % (DISPLAY_NAME, sp, sp, PLUGIN_NAME))
+    print("Do not also enable the %s plugin, or hooks will run twice." % PLUGIN_NAME)
+    return 0
+
+
+def cmd_uninstall(a):
+    sp = os.path.expanduser(a.settings)
+    try:
+        with open(sp) as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        print("nothing to uninstall")
+        return 0
+    hooks = cfg.get("hooks", {})
+    n = 0
+    for ev in list(hooks.keys()):
+        groups = hooks[ev]
+        for g in groups:
+            before = len(g.get("hooks", []))
+            g["hooks"] = [h for h in g.get("hooks", []) if not _is_ours(h)]
+            n += before - len(g["hooks"])
+        hooks[ev] = [g for g in groups if g.get("hooks")]
+        if not hooks[ev]:
+            del hooks[ev]
+    if not hooks:
+        cfg.pop("hooks", None)
+    if not a.dry_run:
+        shutil.copy2(sp, sp + ".%s-bak" % PLUGIN_NAME)
+        with open(sp + ".tmp", "w") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(sp + ".tmp", sp)
+    print("removed %d %s hook(s) from %s" % (n, DISPLAY_NAME, sp))
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog=CLI_NAME, description="%s: agents close what they open and reuse what is open." % DISPLAY_NAME)
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd")
+
+    def sp(name, fn, help_):
+        p = sub.add_parser(name, help=help_)
+        p.set_defaults(fn=fn)
+        p.add_argument("--session", help="agent session id (default: auto-detect)")
+        return p
+
+    p = sp("list", cmd_list, "list resources opened by this session")
+    p.add_argument("--all", action="store_true", help="all sessions")
+    p.add_argument("--history", action="store_true", help="include closed resources")
+    p.add_argument("--json", action="store_true")
+    sp("status", cmd_status, "summary")
+    p = sp("close", cmd_close, "close resources (by id or --all-mine)")
+    p.add_argument("ids", nargs="*")
+    p.add_argument("--all-mine", action="store_true", help="close everything this session opened")
+    p.add_argument("--except-kept", action="store_true", help="skip keep_alive resources")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--grace", type=float, default=None, help="seconds between SIGTERM and SIGKILL")
+    p.add_argument("--protect", default="", help=argparse.SUPPRESS)
+    for name, fn, h in (("keep", cmd_keep, "keep alive (skip idle sweep)"), ("release", cmd_release, "undo keep"),
+                        ("forget", cmd_forget, "stop tracking without closing")):
+        p = sp(name, fn, h)
+        p.add_argument("ids", nargs="+")
+    p = sp("sweep", cmd_sweep, "close leftovers of dead sessions + idle resources of this one")
+    p.add_argument("--dry-run", action="store_true")
+    sp("doctor", cmd_doctor, "environment checks")
+    p = sp("register", cmd_register, "manually register a resource (for other agents/tools)")
+    p.add_argument("--type", required=True, choices=["process", "tab", "simulator", "file"])
+    p.add_argument("--pid", type=int)
+    p.add_argument("--port", type=int)
+    p.add_argument("--command")
+    p.add_argument("--cwd")
+    p.add_argument("--url")
+    p.add_argument("--ref", type=int)
+    p.add_argument("--server", choices=["playwright", "devtools", "chrome-ext", "other"])
+    p.add_argument("--tool-prefix")
+    p.add_argument("--udid")
+    p.add_argument("--not-owned", action="store_true")
+    p.add_argument("--path")
+    p.add_argument("--keep", action="store_true")
+    p.add_argument("--agent")
+    sp("tmpdir", cmd_tmpdir, "print (and create) this session's temp dir")
+    for name, fn in (("install", cmd_install), ("uninstall", cmd_uninstall)):
+        p = sub.add_parser(name, help="%s hooks in ~/.claude/settings.json (manual, non-plugin setup)" % name)
+        p.set_defaults(fn=fn)
+        p.add_argument("--settings", default="~/.claude/settings.json")
+        p.add_argument("--dry-run", action="store_true")
+        if name == "install":
+            p.add_argument("--copy", action="store_true", help="copy this script to the state dir and reference the copy")
+    p = sub.add_parser("hook", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_hook)
+    p.add_argument("event", choices=sorted(HOOKS))
+    p.add_argument("--agent", default="claude", choices=["claude", "codex", "gemini"])
+    p = sub.add_parser("_clean", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_clean)
+    p.add_argument("--session", required=True)
+    p.add_argument("--ids", default="")
+    p.add_argument("--protect", default="")
+    p.add_argument("--final", action="store_true")
+    p.add_argument("--reason", default="")
+    a = ap.parse_args(argv)
+    if not getattr(a, "fn", None):
+        ap.print_help()
+        return 0
+    return a.fn(a) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,42 @@
+{
+  "description": "LeaveNoTrace: register what the agent opens, deny duplicates, sweep idle things, clean up at session end.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|mcp__.*(playwright|chrome|puppeteer|browser|boot_sim|simulator).*",
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/leavenotrace\" hook pre-tool-use", "timeout": 20 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Write|mcp__.*(playwright|chrome|puppeteer|browser|boot_sim|simulator).*",
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/leavenotrace\" hook post-tool-use", "timeout": 30 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/leavenotrace\" hook stop", "timeout": 10 }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/leavenotrace\" hook session-start", "timeout": 15 }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/leavenotrace\" hook session-end", "timeout": 2 }
+        ]
+      }
+    ]
+  }
+}

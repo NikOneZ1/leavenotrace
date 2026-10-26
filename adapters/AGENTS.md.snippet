@@ -1,0 +1,17 @@
+## Resource hygiene (LeaveNoTrace)
+
+Close what you open and reuse what is already open. This repo uses the `leavenotrace` CLI
+(`python3 /path/to/leavenotrace/bin/leavenotrace`, or just `leavenotrace` if it is on PATH).
+
+- Before starting a dev server / background process, opening a browser tab, or booting an iOS simulator,
+  run `leavenotrace list` and reuse an existing one (same port / URL / simulator UDID) instead of starting a duplicate.
+- After you start something that keeps running, register it so it can be cleaned up:
+  `leavenotrace register --type process --pid <PID> [--port <PORT>]`
+  (`--type tab --url <URL> --ref <TAB_ID> --server playwright|devtools|other`,
+  `--type simulator --udid <UDID>` only if YOU booted it, `--type file --path /tmp/...`).
+  Add `--session <ID>` if you are not running inside the agent process tree.
+- Keep resources while later steps need them: `leavenotrace keep <id>`.
+- Write scratch files under `$(leavenotrace tmpdir)` - it is deleted when the session ends.
+- When the task is finished run `leavenotrace close --all-mine`, then close any browser tabs it lists
+  with your browser tool (the CLI cannot close tabs inside your browser).
+- Never use `pkill`, `killall`, `kill $(lsof -ti :PORT)` or `simctl shutdown all`: they hit things you did not open.

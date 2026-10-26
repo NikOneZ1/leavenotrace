@@ -1,0 +1,20 @@
+{
+  "description": "UNTESTED. Codex CLI hooks (https://developers.openai.com/codex/hooks): put in ~/.codex/hooks.json or <repo>/.codex/hooks.json, then review/trust the hooks with /hooks in Codex. Replace /ABS/PATH/TO with the real path. Codex was never run against this config in this project's test-suite; the shared hook handler is exercised only with Claude Code payloads. Codex's `shell` tool is reported as tool_name \"Bash\" per the Codex docs.",
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "startup|resume", "hooks": [ { "type": "command", "command": "python3 /ABS/PATH/TO/leavenotrace/bin/leavenotrace hook session-start --agent codex" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "python3 /ABS/PATH/TO/leavenotrace/bin/leavenotrace hook pre-tool-use --agent codex" } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "python3 /ABS/PATH/TO/leavenotrace/bin/leavenotrace hook post-tool-use --agent codex" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "python3 /ABS/PATH/TO/leavenotrace/bin/leavenotrace hook stop --agent codex" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "python3 /ABS/PATH/TO/leavenotrace/bin/leavenotrace hook session-end --agent codex", "timeout": 3 } ] }
+    ]
+  }
+}
